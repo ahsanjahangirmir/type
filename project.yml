@@ -1,0 +1,86 @@
+name: Type
+options:
+  bundleIdPrefix: com.ajm
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+targets:
+  Type:
+    type: application
+    platform: macOS
+    sources:
+      - path: Type
+    settings:
+      base:
+        PRODUCT_NAME: Type
+        PRODUCT_MODULE_NAME: TypeApp
+        PRODUCT_BUNDLE_IDENTIFIER: com.ajm.type
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    info:
+      path: Type/Info.plist
+      properties:
+        CFBundleDisplayName: Type
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: "26.0"
+        NSHumanReadableCopyright: "© 2026 Ahsan Jahangir Mir"
+        NSSupportsAutomaticTermination: true
+        NSSupportsSuddenTermination: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Markdown Document
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Default
+            LSItemContentTypes: [net.daringfireball.markdown]
+          - CFBundleTypeName: Plain Text Document
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.plain-text]
+          - CFBundleTypeName: Rich Text Document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.rtf]
+          - CFBundleTypeName: Word Document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [org.openxmlformats.wordprocessingml.document]
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: net.daringfireball.markdown
+            UTTypeDescription: Markdown Document
+            UTTypeConformsTo: [public.plain-text]
+            UTTypeTagSpecification:
+              public.filename-extension: [md, markdown, mdown, mkd]
+              public.mime-type: [text/markdown]
+  TypeTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: TypeTests
+    dependencies:
+      - target: Type
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ajm.type.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Type.app/Contents/MacOS/Type"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+schemes:
+  Type:
+    build:
+      targets:
+        Type: all
+        TypeTests: [test]
+    test:
+      targets: [TypeTests]
