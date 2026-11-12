@@ -72,3 +72,7 @@ Branch: feat/type-product-site. Website in website/. Vercel CLI Preview deployme
 The hero now pins briefly while its one focus variable recedes the headline and interface fragments, levels the actual window, and brings the writing surface forward. Phone treatment uses a shorter travel and pin distance. Reduced motion has no pin. This makes the selected signature an experienced transition rather than only a decorative tilted screenshot.
 
 Capture correction: an initial native app-name resolution observed an earlier temporary build's restored real-library view. No UI edits or published captures were made from that view. The disposable source was hardened to override libraryPath unconditionally and given a distinct display name before capture continued. All published media was inspected to contain only sample writing. No user app code was changed.
+
+
+## Deployment authorization update
+The user approved the initial Production deployment after Vercel CLI refused Preview for a project's first deployment. Deploy only the website from `feat/type-product-site` to the dedicated `type-product-page` project. Keep automatic Git deployments disabled and existing indexing restrictions. Stable public address: https://type-product-page.vercel.app.

@@ -62,3 +62,10 @@ Vercel dry run: only website sources/assets/configuration. Native app source, al
 ## Deployment status
 
 Vercel CLI 65.14.0 refused the explicit Preview deployment with `first_deployment_production`: a new project's first deployment is assigned to Production, and the CLI requires user approval before retrying with `--prod`. No deployment was created. The project is linked and ready, but changing the agreed Preview-only delivery to an initial Production deployment is pending approval. No unrelated existing Vercel project was repurposed.
+
+
+## Approved Production deployment
+
+The user explicitly approved the initial Production deployment on November 12, 2026. Source: `feat/type-product-site`, commit `3746fb5c57fd440c49b4ef86f985901464a086df`. Public domain: https://type-product-page.vercel.app. Vercel reports Production / Ready. A final build supplies `SITE_URL=https://type-product-page.vercel.app` so canonical, Open Graph and sitemap use the stable address. Existing noindex and robots restrictions remain in place. The historical Preview-only limitation above was resolved by this explicit approval. No main-branch changes, GitHub push, merge, or app-source deployment occurred.
+
+Live verification on https://type-product-page.vercel.app: **26/26 functional checks pass**, with zero browser runtime errors. Canonical and Open Graph URLs match the stable public domain; sharing image, all three theme images, robots and sitemap return HTTP 200. HTTP 404 handling was verified against the live host. The verification script now waits for each real theme image to load before asserting, eliminating the localhost-only timing assumption. This verification-only change and deployment documentation do not change the deployed product assets.

@@ -14,6 +14,10 @@ await page.locator('.focus-switch').click();
 assert(await page.locator('.focus-switch').getAttribute('aria-pressed')==='false','Focus mode reverses');
 for(const theme of ['sepia','slate','paper']){
  await page.locator(`[data-theme-choice=${theme}]`).click();
+ await page.waitForFunction(id => {
+  const image = document.querySelector(`[data-theme-image=${id}]`);
+  return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0;
+ }, theme, { timeout: 15000 });
  assert(await page.locator(`[data-theme-image=${theme}]`).evaluate(el=>el.classList.contains('is-active')&&el.complete&&el.naturalWidth>0),`${theme} preview uses a loaded real capture`);
  assert(await page.locator('[data-theme-choice][aria-pressed=true]').count()===1,`${theme} has one selected control`);
 }
