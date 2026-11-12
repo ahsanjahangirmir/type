@@ -10,7 +10,7 @@ final class VisualSnapshotTests: XCTestCase {
         ProcessInfo.processInfo.environment["TYPE_SNAPSHOT_DIR"].map { URL(fileURLWithPath: $0) }
     }
 
-    private func render(_ markdown: String, name: String, baseURL: URL?, configure: (inout EditorConfig) -> Void) throws {
+    private func render(_ markdown: String, name: String, baseURL: URL?, dark: Bool = false, prepare: ((TypeTextView) -> Void)? = nil, configure: (inout EditorConfig) -> Void) throws {
         guard let outDir else { throw XCTSkip("Set TEST_RUNNER_TYPE_SNAPSHOT_DIR to render snapshots") }
         var config = AppSettings.shared.editorConfig
         config.fontChoice = .serif
@@ -26,13 +26,15 @@ final class VisualSnapshotTests: XCTestCase {
         let host = NSHostingView(rootView: view)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 1100), styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        window.appearance = NSAppearance(named: .aqua)
+        window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         window.contentView = host
         window.layoutIfNeeded()
         for _ in 0..<6 { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
         guard let tv = controller.textView else { return XCTFail("no text view") }
         tv.layoutImageViews()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        prepare?(tv)
+        for _ in 0..<4 { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
+        host.layoutSubtreeIfNeeded()
         let rect = host.bounds
         let rep = host.bitmapImageRepForCachingDisplay(in: rect)!
         host.cacheDisplay(in: rect, to: rep)
@@ -107,11 +109,7 @@ final class VisualSnapshotTests: XCTestCase {
     """
 
     func testRenderHiddenSyntax() throws {
-        try render(sample, name: "hidden", baseURL: nil) { $0.hideSyntax = true }
-    }
-
-    func testRenderVisibleSyntax() throws {
-        try render(sample, name: "visible", baseURL: nil) { $0.hideSyntax = false }
+        try render(sample, name: "hidden", baseURL: nil) { _ in }
     }
 
     func testRenderImage() throws {
@@ -125,7 +123,46 @@ final class VisualSnapshotTests: XCTestCase {
         }
         try ImageStore.pngData(img)!.write(to: dir.appendingPathComponent(".assets/shot.png"))
         let md = "# Screenshot test\n\nA paragraph before the image.\n\n> A quote right above.\n![shot](.assets/shot.png \"width=420\")\nText right after the image.\n"
-        try render(md, name: "image", baseURL: dir) { $0.hideSyntax = true }
+        try render(md, name: "image", baseURL: dir) { _ in }
+    }
+
+    /// Irregular tables and a selected image, with the user's settings (focus mode, low opacity).
+    func testRenderTablesAndSelectedImage() throws {
+        guard let outDir else { throw XCTSkip("no snapshot dir") }
+        let dir = outDir.appendingPathComponent("tabledoc")
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent(".assets"), withIntermediateDirectories: true)
+        let img = NSImage(size: NSSize(width: 600, height: 240), flipped: false) { r in
+            NSGradient(colors: [.systemPurple, .systemOrange])!.draw(in: r, angle: 20)
+            return true
+        }
+        try ImageStore.pngData(img)!.write(to: dir.appendingPathComponent(".assets/shot.png"))
+        let md = """
+        | Hello there | What's Up | | Hello there |
+        | --- | --- | --- | --- |
+        | this is a reminder | what do you mean | | this is also a reminder | | |
+        | | | | | | | |
+
+        ![shot](.assets/shot.png "width=360")
+
+        ==what do you mean? So we have to work on our relationship now?==
+
+        | A | B |
+        | --- | --- |
+        | short |
+        | x | y | z |
+
+        """
+        for dark in [false, true] {
+            try render(md, name: dark ? "tables-dark" : "tables-light", baseURL: dir, dark: dark, prepare: { tv in
+                let r = (tv.string as NSString).range(of: "![shot]")
+                tv.setSelectedRange(NSRange(location: r.location + 3, length: 0))
+                // (A light-mode render with a ranged selection comes out blank in this harness, with or without the fix.)
+                if dark { tv.setSelectedRange(NSRange(location: r.location + 3, length: 6)) }
+            }) {
+                $0.focusMode = true; $0.focusOpacity = 0.19
+                $0.fontChoice = .custom; $0.customFontFamily = "Avenir Next"; $0.fontSize = 14; $0.lineHeight = 1.2
+            }
+        }
     }
 
     func testExportDocuments() async throws {

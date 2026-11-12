@@ -14,7 +14,6 @@ final class LiveEditor {
         var config = AppSettings.shared.editorConfig
         config.fontChoice = .sans
         config.fontSize = 16
-        config.hideSyntax = true
         config.focusMode = false
         config.typewriterScrolling = false
         config.smartQuotes = false; config.smartDashes = false; config.smartArrows = false

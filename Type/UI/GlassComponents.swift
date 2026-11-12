@@ -20,7 +20,7 @@ struct StatusPill: View {
                         Circle().trim(from: 0, to: progress)
                             .stroke(progress >= 1 ? Color.green : Color.accentColor, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
                             .rotationEffect(.degrees(-90))
-                            .animation(.smooth, value: progress)
+                            .animation(Motion.animation(.smooth), value: progress)
                     }
                     .frame(width: 14, height: 14)
                 }
@@ -28,7 +28,7 @@ struct StatusPill: View {
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .contentTransition(.numericText())
-                    .animation(.snappy, value: stats.words)
+                    .animation(Motion.animation(.snappy), value: stats.words)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 9)
@@ -44,16 +44,8 @@ struct StatusPill: View {
     }
 
     private var summary: String {
-        var parts = ["\(stats.words.formatted()) \(stats.words == 1 ? "word" : "words")"]
-        if goal > 0 { parts[0] = "\(stats.words.formatted()) / \(goal.formatted())" }
-        if settings.showCharacters {
-            let chars = settings.countSpaces ? stats.characters : stats.charactersNoSpaces
-            parts.append("\(chars.formatted()) characters")
-        }
-        if settings.showReadingTime, stats.words > 0 {
-            parts.append("\(stats.readingMinutes(wordsPerMinute: settings.wordsPerMinute)) min read")
-        }
-        return parts.joined(separator: "  ·  ")
+        stats.summary(goal: goal, showCharacters: settings.showCharacters, countSpaces: settings.countSpaces,
+                      showReadingTime: settings.showReadingTime, wordsPerMinute: settings.wordsPerMinute)
     }
 }
 
@@ -123,7 +115,7 @@ struct GoalToast: View {
     @State private var bounce = false
 
     var body: some View {
-        Label("Goal reached — \(goal.formatted()) words", systemImage: "checkmark.seal.fill")
+        Label("Goal reached — \(DocumentStats.count(goal, "word"))", systemImage: "checkmark.seal.fill")
             .font(.callout.weight(.medium))
             .symbolEffect(.bounce, value: bounce)
             .padding(.horizontal, 16)
@@ -162,6 +154,15 @@ struct SlashMenu: View {
                                         Text(item.subtitle).font(.caption).foregroundStyle(.secondary)
                                     }
                                     Spacer(minLength: 0)
+                                    if let shortcut = item.shortcut {
+                                        Text(shortcut).font(.caption).foregroundStyle(.tertiary)
+                                    }
+                                    if controller.slash?.format != nil {
+                                        // A fixed slot keeps the shortcuts aligned whether or not a row is checked.
+                                        Image(systemName: "checkmark").font(.callout.weight(.semibold)).foregroundStyle(Color.accentColor)
+                                            .opacity(controller.isActive(item) ? 1 : 0)
+                                            .frame(width: 14)
+                                    }
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 5)
@@ -200,17 +201,22 @@ struct OutlineSidebar: View {
                 ContentUnavailableView("No Headings", systemImage: "list.bullet.indent",
                                        description: Text("Start a line with # to add a heading."))
             } else {
-                List(selection: Binding(
-                    get: { controller.currentHeading },
-                    set: { if let item = $0 { controller.reveal(item) } }
-                )) {
+                // Plain buttons rather than a selection list, so clicking the heading that is
+                // already highlighted still scrolls to it.
+                List {
                     ForEach(controller.outline) { item in
-                        Text(item.title)
-                            .font(item.level == 1 ? .body.weight(.semibold) : .body)
-                            .foregroundStyle(item.level <= 2 ? .primary : .secondary)
-                            .lineLimit(2)
-                            .padding(.leading, CGFloat(item.level - 1) * 12)
-                            .tag(item)
+                        Button { controller.reveal(item) } label: {
+                            Text(item.title)
+                                .font(item.level == 1 ? .body.weight(.semibold) : .body)
+                                .foregroundStyle(item.level <= 2 ? .primary : .secondary)
+                                .lineLimit(2)
+                                .padding(.leading, CGFloat(item.level - 1) * 12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(item == controller.currentHeading ? RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.18)).padding(.horizontal, 6) : nil)
+                        .accessibilityAddTraits(item == controller.currentHeading ? .isSelected : [])
                     }
                 }
                 .listStyle(.sidebar)

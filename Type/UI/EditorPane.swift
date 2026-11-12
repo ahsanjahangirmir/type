@@ -2,16 +2,18 @@ import SwiftUI
 
 /// Per-file writing goals, persisted by path.
 enum GoalStore {
-    private static let key = "writingGoals"
+    static let key = "writingGoals"
+    /// Where goals are kept (replaced in tests).
+    nonisolated(unsafe) static var defaults = UserDefaults.standard
     static func goal(for url: URL?) -> Int {
         guard let url else { return 0 }
-        return (UserDefaults.standard.dictionary(forKey: key)?[url.standardizedFileURL.path] as? Int) ?? 0
+        return (defaults.dictionary(forKey: key)?[url.standardizedFileURL.path] as? Int) ?? 0
     }
     static func set(_ goal: Int, for url: URL?) {
         guard let url else { return }
-        var all = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+        var all = defaults.dictionary(forKey: key) ?? [:]
         all[url.standardizedFileURL.path] = goal > 0 ? goal : nil
-        UserDefaults.standard.set(all, forKey: key)
+        defaults.set(all, forKey: key)
     }
 }
 
@@ -29,8 +31,9 @@ struct EditorPane: View {
 
     @EnvironmentObject private var settings: AppSettings
     @State private var goal = 0
-    @State private var goalCelebrated = false
+    @State private var celebration = GoalCelebration()
     @State private var showGoalToast = false
+    @State private var toastHide: Task<Void, Never>?
     @State private var editorSize: CGSize = .zero
 
     private var chromeShown: Bool { controller.chromeVisible || !settings.autoHideChrome }
@@ -43,7 +46,7 @@ struct EditorPane: View {
             .overlay(alignment: .topLeading) { slashOverlay }
             .overlay(alignment: .bottom) {
                 VStack(spacing: 10) {
-                    if showGoalToast { GoalToast(goal: goal).transition(.move(edge: .bottom).combined(with: .opacity)) }
+                    if showGoalToast { GoalToast(goal: goal).transition(Motion.transition(.move(edge: .bottom).combined(with: .opacity))) }
                     if settings.showStats {
                         StatusPill(controller: controller, goal: $goal)
                             .opacity(chromeShown ? 1 : 0.55)
@@ -57,7 +60,7 @@ struct EditorPane: View {
             .onContinuousHover { phase in
                 if case .active = phase { controller.mouseMoved() }
             }
-            .animation(.smooth(duration: 0.3), value: chromeShown)
+            .animation(Motion.animation(.smooth(duration: 0.3)), value: chromeShown)
             .inspector(isPresented: $showOutline) {
                 OutlineSidebar(controller: controller)
                     .inspectorColumnWidth(min: 200, ideal: 240, max: 360)
@@ -70,42 +73,42 @@ struct EditorPane: View {
             .onChange(of: fileURL) { _, url in
                 controller.fileURL = url
                 goal = GoalStore.goal(for: url)
-                goalCelebrated = goal > 0 && controller.stats.words >= goal
+                // `controller.stats` still describes the previous page here, so count this page's text.
+                celebration.reset(goal: goal, words: goal > 0 ? DocumentAnalysis.analyze(text).0.words : 0)
+                toastHide?.cancel()
+                showGoalToast = false
             }
             .onChange(of: controller.stats.words) { _, words in checkGoal(words) }
             .onChange(of: goal) { _, newGoal in
                 GoalStore.set(newGoal, for: fileURL)
-                goalCelebrated = controller.stats.words >= newGoal && newGoal > 0
+                celebration.reset(goal: newGoal, words: newGoal > 0 ? DocumentAnalysis.analyze(text).0.words : 0)
             }
     }
 
-    /// The slash menu opens below the caret, or above it when there isn't room
+    /// The slash and Format menus open below the caret (or the selection's last line), or above it when there isn't room
     /// (near the bottom of the window, above the statistics pill).
     @ViewBuilder
     private var slashOverlay: some View {
         if let slash = controller.slash {
             let height = SlashMenu.height(for: controller.filteredSlashCommands.count)
             let bottomLimit = editorSize.height - (settings.showStats ? 64 : 16)
-            let below = editorSize.height == 0 || slash.rect.maxY + 8 + height <= bottomLimit || slash.rect.minY - 8 - height < 8
+            let below = editorSize.height == 0 || slash.rect.maxY + 8 + height <= bottomLimit || (slash.aboveRect ?? slash.rect).minY - 8 - height < 8
             let x = min(max(12, slash.rect.minX - 10), max(12, editorSize.width - SlashMenu.width - 12))
-            let y = below ? slash.rect.maxY + 8 : slash.rect.minY - 8 - height
+            let y = below ? slash.rect.maxY + 8 : (slash.aboveRect ?? slash.rect).minY - 8 - height
             SlashMenu(controller: controller, state: slash)
                 .offset(x: x, y: max(8, y))
-                .transition(.scale(scale: 0.92, anchor: below ? .topLeading : .bottomLeading).combined(with: .opacity))
+                .transition(Motion.transition(.scale(scale: 0.92, anchor: below ? .topLeading : .bottomLeading).combined(with: .opacity)))
         }
     }
 
     private func checkGoal(_ words: Int) {
-        guard goal > 0 else { return }
-        if words >= goal, !goalCelebrated {
-            goalCelebrated = true
-            withAnimation(.bouncy) { showGoalToast = true }
-            Task {
-                try? await Task.sleep(for: .seconds(3.5))
-                withAnimation(.smooth) { showGoalToast = false }
-            }
-        } else if words < goal {
-            goalCelebrated = false
+        guard celebration.update(goal: goal, words: words) else { return }
+        withAnimation(.bouncy) { showGoalToast = true }
+        toastHide?.cancel()
+        toastHide = Task {
+            try? await Task.sleep(for: .seconds(3.5))
+            guard !Task.isCancelled else { return }
+            withAnimation(.smooth) { showGoalToast = false }
         }
     }
 }
@@ -161,7 +164,7 @@ struct EditorToolbar: ToolbarContent {
             Toggle(isOn: $settings.focusMode) { Label("Focus", systemImage: "scope") }
                 .help("Focus Mode (⇧⌘F)")
             Toggle(isOn: $settings.typewriterScrolling) { Label("Typewriter", systemImage: "character.cursor.ibeam") }
-                .help("Typewriter Scrolling (⌥⌘T)")
+                .help("Typewriter Scrolling (⌃⌘T)")
             Menu {
                 Toggle("Typing Sounds", isOn: $settings.typingSounds)
                 Divider()
@@ -198,7 +201,6 @@ struct EditorToolbar: ToolbarContent {
 
         ToolbarItem(placement: .primaryAction) {
             Toggle(isOn: $showOutline) { Label("Outline", systemImage: "sidebar.right") }
-                .keyboardShortcut("o", modifiers: [.command, .option])
                 .help("Show Outline (⌥⌘O)")
         }
     }

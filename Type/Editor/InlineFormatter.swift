@@ -26,6 +26,7 @@ enum InlineFormatter {
     static func spans(in line: String) -> [InlineSpan] {
         let ns = line as NSString
         let all = NSRange(location: 0, length: ns.length)
+        let line = MarkdownEscapes.masked(line)
         var result: [InlineSpan] = []
         var code: [NSRange] = []
         for m in MDPattern.codeSpan.matches(in: line, range: all) {
@@ -161,15 +162,15 @@ enum InlineFormatter {
 
     /// The marker for `format` around `inner`, picking `__`/`_` where `**`/`*`
     /// would run into a neighbouring asterisk (`***x** y*` doesn't parse; `*__x__ y*` does).
-    static func marker(for format: InlineFormat, inner: String, before: unichar?, after: unichar?) -> String {
+    static func marker(for format: InlineFormat, inner: String, before: unichar?, after: unichar?, underscores: Bool = false) -> String {
         let star: unichar = 42
         let i = inner as NSString
         let touchesStar = before == star || after == star
             || (i.length > 0 && (i.character(at: 0) == star || i.character(at: i.length - 1) == star))
         let intraword = isWordChar(before) || isWordChar(after)
         switch format {
-        case .bold: return touchesStar && !intraword ? "__" : "**"
-        case .italic: return touchesStar && !intraword ? "_" : "*"
+        case .bold: return (touchesStar || underscores) && !intraword ? "__" : "**"
+        case .italic: return (touchesStar || underscores) && !intraword ? "_" : "*"
         case .strike: return "~~"
         case .highlight: return "=="
         case .code: return inner.contains("`") ? "``" : "`"
@@ -258,15 +259,44 @@ enum InlineFormatter {
     }
 
     /// Opening/closing markers for text typed with `formats` pending (no selection).
-    static func wrap(_ text: String, in formats: Set<InlineFormat>, before: unichar?, after: unichar?) -> (open: String, close: String) {
+    static func wrap(_ text: String, in formats: Set<InlineFormat>, before: unichar?, after: unichar?, underscores: Bool = false) -> (open: String, close: String) {
         var open = "", close = ""
         var inner = text
         for f in [InlineFormat.code, .italic, .bold, .strike, .highlight] where formats.contains(f) {
-            let m = marker(for: f, inner: inner, before: before, after: after)
+            let m = marker(for: f, inner: inner, before: before, after: after, underscores: underscores)
             open = m + open
             close += m
             inner = m + inner + m
         }
         return (open, close)
+    }
+
+    // MARK: Health checks
+
+    /// Total number of formats applied by the spans of `line`.
+    static func formatCount(in line: String) -> Int {
+        spans(in: line).reduce(0) { $0 + $1.formats.count }
+    }
+
+    /// Offsets of marker characters in `line` that no span uses and nothing escapes: they would be drawn.
+    static func strayIndices(in line: String) -> [Int] {
+        let masked = MarkdownEscapes.masked(line) as NSString
+        let lone = MarkdownEscapes.scanAll(line as NSString).loneTicks.flatMap { Array($0.location..<NSMaxRange($0)) }
+        guard !lone.isEmpty || (0..<masked.length).contains(where: { isMarker(masked.character(at: $0)) }) else { return [] }
+        var used = Set<Int>()
+        for span in spans(in: line) {
+            for r in [span.open, span.close] { used.formUnion(r.location..<NSMaxRange(r)) }
+            if span.formats == [.code] { used.formUnion(span.content.location..<NSMaxRange(span.content)) }
+        }
+        let markers = (0..<masked.length).filter { !used.contains($0) && isMarker(masked.character(at: $0)) }
+        return Array(Set(markers).union(lone.filter { !used.contains($0) })).sorted()
+    }
+
+    static func strayMarkers(in line: String) -> Int { strayIndices(in: line).count }
+
+    /// True when no two spans of `line` partly overlap (`_a **b_ c**` crosses).
+    static func isWellNested(_ line: String) -> Bool {
+        let all = spans(in: line).map(\.range)
+        return !all.contains { a in all.contains { b in NSIntersectionRange(a, b).length > 0 && NSUnionRange(a, b) != a && NSUnionRange(a, b) != b } }
     }
 }

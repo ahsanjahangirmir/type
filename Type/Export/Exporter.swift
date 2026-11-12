@@ -83,7 +83,7 @@ enum Exporter {
             let attributed = try attributedString(markdown: markdown, title: title, baseURL: baseURL, fontChoice: fontChoice, customFamily: customFamily)
             let type: NSAttributedString.DocumentType = format == .word ? .officeOpenXML : .rtf
             let data = try attributed.data(from: NSRange(location: 0, length: attributed.length), documentAttributes: [
-                .documentType: type, .title: title,
+                .documentType: type, .title: title, .paperSize: NSPrintInfo.shared.paperSize,
                 .topMargin: pageMargin, .bottomMargin: pageMargin, .leftMargin: pageMargin, .rightMargin: pageMargin,
             ])
             try data.write(to: url, options: .atomic)
@@ -160,11 +160,13 @@ enum Exporter {
             """
         case .paged:
             css = """
-            @page { margin: 0; }
+            @page { margin: \(Int(pageMargin))pt; }
             html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
             body { margin: 0; font-family: \(font); font-size: 11.5pt; line-height: 1.55; color: #1d1d1f; -webkit-font-smoothing: antialiased; }
-            h1, h2, h3, h4, h5, h6, tr, img, pre, blockquote { break-inside: avoid; }
-            h1, h2, h3, h4, h5, h6 { break-after: avoid; }
+            h1, h2, h3, h4, h5, h6, table, tr, img, pre, blockquote { break-inside: avoid; page-break-inside: avoid; }
+            h1, h2, h3, h4, h5, h6 { break-after: avoid; page-break-after: avoid; }
+            p { orphans: 2; widows: 2; }
+            img { max-height: 95vh; width: auto; object-fit: contain; }
             \(sharedCSS(mono: mono))
             body > :first-child { margin-top: 0; }
             """

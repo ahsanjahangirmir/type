@@ -6,6 +6,9 @@ protocol TypeTextViewEvents: AnyObject {
     func textView(_ textView: TypeTextView, didBeginSlashAt location: Int)
     /// Return true to swallow the command (used for slash-menu navigation).
     func textView(_ textView: TypeTextView, handleSlashCommand selector: Selector) -> Bool
+    /// Keyboard text typed over the selection: return true to swallow it (Format menu).
+    func textView(_ textView: TypeTextView, handleTypedText typed: String) -> Bool
+    func textViewWillMouseDown(_ textView: TypeTextView)
 }
 
 /// The writing surface: a TextKit 1 NSTextView tuned for distraction-free
@@ -15,7 +18,6 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         didSet { if config != oldValue { applyChrome(); updateLayoutInsets() } }
     }
     weak var events: TypeTextViewEvents?
-    private var lastMouse: NSPoint = .zero
     private var trackingArea: NSTrackingArea?
     private var focusedParagraph: NSRange?
 
@@ -28,20 +30,37 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     var imagePasteHandler: ((NSPasteboard) -> [ImageStore.Saved]?)?
     private var imageViews: [ImageBlockView] = []
     private var imageLayoutScheduled = false
+    /// Image runs of the current text; rescanned only after the text is restyled.
+    private var imageRuns: [(range: NSRange, spec: ImageSpec)] = []
+    private var imageRunsStale = true
 
     /// The caret (drawn by us so it keeps one height and can glide).
     let caretOverlay = CaretOverlay(frame: .zero)
     private var caretUpdateScheduled = false
     private var caretAnimates = false
     private var windowObservers: [NSObjectProtocol] = []
+    private var lastClipHeight: CGFloat = 0
     /// Just-typed characters that are still fading in.
     private var fades: [(range: NSRange, start: CFTimeInterval)] = []
     private var fadeLink: CADisplayLink?
     static let fadeDuration: CFTimeInterval = 0.13
     /// Formats to turn on (true) or off (false) for the next typed character;
     /// set by ⌘B, ⌘I… when nothing is selected, like a word processor.
-    private(set) var pendingFormats: [InlineFormat: Bool] = [:]
-    private var pendingFormatLocation = -1
+    var pendingFormats: [InlineFormat: Bool] = [:]
+    var pendingFormatLocation = -1
+    /// After a space typed at the end of a formatted span (stored outside the
+    /// closing markers): the next character moves the markers behind itself.
+    var rejoin: (closeStart: Int, markers: String, location: Int)?
+    /// Where a deletion just happened, to drop spans left empty.
+    var emptySpanCheck: Int?
+    /// Markers the edited line showed before the edit (an increase afterwards is healed).
+    var strayBaseline: Int?
+    var healingSuspended = false
+    /// Programmatic edits (toolbar, slash menu, paste of Markdown) may create structure; typing and deleting may not.
+    var programmaticDepth = 0
+    var userEditDepth = 0
+    /// Whether the edited line began with block syntax before the edit.
+    var blockBaseline: Bool?
 
     var smoothTyping: Bool {
         config?.smoothTyping == true && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -62,6 +81,10 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     func installLayoutDelegate() {
+        if !(layoutManager is TypeLayoutManager), let container = textContainer {
+            container.replaceLayoutManager(TypeLayoutManager())
+            layoutManager?.allowsNonContiguousLayout = true
+        }
         layoutManager?.delegate = self
         installCaretOverlay()
         // Inline predictions show grey suggested text inside the word being
@@ -78,7 +101,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         super.setFrameSize(newSize)
         caretOverlay.frame = bounds
         updateLayoutInsets()
-        scheduleImageLayout()
+        scheduleImageLayout(textChanged: false)
         scheduleCaretUpdate(animated: false)
     }
 
@@ -91,6 +114,17 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
             windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.scheduleCaretUpdate(animated: false) }
+            })
+        }
+        if let clip = enclosingScrollView?.contentView {
+            // Typewriter padding depends on the visible height, which the text view's own size doesn't reflect.
+            lastClipHeight = clip.bounds.height
+            windowObservers.append(NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let clip = self.enclosingScrollView?.contentView, clip.bounds.height != self.lastClipHeight else { return }
+                    self.lastClipHeight = clip.bounds.height
+                    self.updateLayoutInsets()
+                }
             })
         }
         scheduleCaretUpdate(animated: false)
@@ -140,21 +174,17 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
-        let p = event.locationInWindow
-        if hypot(p.x - lastMouse.x, p.y - lastMouse.y) > 4 {
-            lastMouse = p
-            events?.textViewMouseMoved(self)
-        }
-        let point = convert(p, from: nil)
+        // The chrome decides on screen coordinates, so forward every move.
+        events?.textViewMouseMoved(self)
+        let point = convert(event.locationInWindow, from: nil)
         if (event.modifierFlags.contains(.command) && link(at: point) != nil)
-            || (config?.hideSyntax == true && taskBox(at: point) != nil) {
+            || taskBox(at: point) != nil {
             NSCursor.pointingHand.set()
         }
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        guard config?.hideSyntax == true else { return }
         for (range, _) in attributeRuns(.typeTaskBox, in: visibleCharacterRange()) {
             addCursorRect(checkboxRect(forCharacterAt: range.location).insetBy(dx: -4, dy: -4), cursor: .pointingHand)
         }
@@ -185,6 +215,9 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         if selector == #selector(insertNewline(_:)), insertTableRowOnNewline() { return }
         if selector == #selector(insertTab(_:)), moveToTableCell(forward: true) { return }
         if selector == #selector(insertBacktab(_:)), moveToTableCell(forward: false) { return }
+        if selector == #selector(insertNewline(_:)), breakLineOutsideSpans(continuingList: { [self] closers, openers in
+            config?.continueLists == true && continueListOnNewline(closers: closers, openers: openers)
+        }) { return }
         if selector == #selector(insertNewline(_:)), config?.continueLists == true, continueListOnNewline() { return }
         if selector == #selector(insertTab(_:)), indentListItem(outdent: false) { return }
         if selector == #selector(insertBacktab(_:)), indentListItem(outdent: true) { return }
@@ -192,47 +225,72 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
+        userEditDepth += 1
+        defer { userEditDepth -= 1 }
         let typed = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
-        guard config != nil, typed.count == 1, !hasMarkedText() else {
+        if interceptsFormatMenuInput(typed, replacementRange: replacementRange) { return }
+        guard config != nil, !typed.isEmpty, !hasMarkedText() else {
             super.insertText(string, replacementRange: replacementRange)
+            return
+        }
+        // Typed characters are literal: Markdown punctuation is stored escaped.
+        let literal = literalText(typed, replacing: replacementRange.location != NSNotFound ? replacementRange : selectedRange())
+        guard typed.count == 1 else {
+            super.insertText(literal, replacementRange: replacementRange)
             return
         }
         let fromKeyboard = NSApp.currentEvent?.type == .keyDown
         let plain = replacementRange.location == NSNotFound || replacementRange == selectedRange()
-        if !(plain && (typeBesideAtomicLine(typed) || insertWithPendingFormats(typed))) {
-            insertSmart(string, typed: typed, replacementRange: replacementRange)
+        if !(plain && (typeBesideAtomicLine(literal) || insertWithPendingFormats(literal, typed: typed))) {
+            insertSmart(typed: typed, literal: literal, replacementRange: replacementRange)
         }
         if fromKeyboard { fadeInCharacterBeforeCaret() }
     }
 
+    /// Inserts `text` over `range`, keeping formatted spans valid at their edges.
+    private func commit(_ text: String, replacing range: NSRange) {
+        let wasRejoining = rejoin != nil
+        if range.length == 0, insertAtSpanEdge(text, at: range.location) { return }
+        let saved = rejoin
+        super.insertText(text, replacementRange: range)
+        if wasRejoining, let saved, text.first == " " || text.first == "\t" {
+            rejoin = (saved.closeStart, saved.markers, selectedRange().location)
+        }
+    }
+
     /// Smart quotes, dashes, arrows, ellipses and auto-capitalization.
-    private func insertSmart(_ string: Any, typed: String, replacementRange: NSRange) {
+    private func insertSmart(typed: String, literal: String, replacementRange: NSRange) {
         guard let config else { return }
         let ns = self.string as NSString
         let sel = replacementRange.location != NSNotFound ? replacementRange : selectedRange()
         let loc = sel.location
-        let prev: Character? = loc > 0 ? Character(ns.substring(with: ns.rangeOfComposedCharacterSequence(at: loc - 1))) : nil
-        let prev2: Character? = loc > 1 ? Character(ns.substring(with: ns.rangeOfComposedCharacterSequence(at: loc - 2))) : nil
+        // NSString's composed sequences and Swift's grapheme clusters can disagree
+        // (ZWJ, some Indic sequences), so never force one into a single Character.
+        let prev: Character? = loc > 0 ? ns.substring(with: ns.rangeOfComposedCharacterSequence(at: loc - 1)).last : nil
+        let prev2: Character? = loc > 1 ? ns.substring(with: ns.rangeOfComposedCharacterSequence(at: loc - 2)).last : nil
         let inCode = loc > 0 && (textStorage?.attribute(.typeCode, at: loc - 1, effectiveRange: nil) != nil)
         let inComment = loc > 0 && (textStorage?.attribute(.typeComment, at: loc - 1, effectiveRange: nil) != nil)
         let linePrefix = ns.substring(with: NSRange(location: ns.lineRange(for: NSRange(location: loc, length: 0)).location, length: loc - ns.lineRange(for: NSRange(location: loc, length: 0)).location))
 
+        let unescapedPrefix = MarkdownEscapes.unescaped(linePrefix)
         func replacePrevious(_ count: Int, with text: String) {
-            super.insertText(text, replacementRange: NSRange(location: loc - count, length: count + sel.length))
+            // An escaped character goes together with its backslash.
+            let n = isEscapeBackslash(loc - count - 1) ? count + 1 : count
+            commit(text, replacing: NSRange(location: loc - n, length: n + sel.length))
         }
 
         if !inCode {
             switch typed {
             case "\"" where config.smartQuotes:
-                super.insertText(Self.opens(prev) ? "\u{201C}" : "\u{201D}", replacementRange: sel); return
+                commit(Self.opens(prev) ? "\u{201C}" : "\u{201D}", replacing: sel); return
             case "'" where config.smartQuotes:
-                super.insertText(Self.opens(prev) ? "\u{2018}" : "\u{2019}", replacementRange: sel); return
+                commit(Self.opens(prev) ? "\u{2018}" : "\u{2019}", replacing: sel); return
             case "." where config.smartEllipses && prev == "." && prev2 == ".":
                 replacePrevious(2, with: "\u{2026}"); return
             case "-" where config.smartDashes && prev == "-" && !inComment && prev2 != "!" && prev2 != "<"
-                && !linePrefix.trimmingCharacters(in: .whitespaces).allSatisfy({ $0 == "-" }):
+                && !unescapedPrefix.trimmingCharacters(in: .whitespaces).allSatisfy({ $0 == "-" }):
                 replacePrevious(1, with: "\u{2014}"); return
-            case ">" where config.smartArrows && !inComment && prev == "-" && prev2 != "-" && !linePrefix.trimmingCharacters(in: .whitespaces).allSatisfy({ $0 == "-" }):
+            case ">" where config.smartArrows && !inComment && prev == "-" && prev2 != "-" && !unescapedPrefix.trimmingCharacters(in: .whitespaces).allSatisfy({ $0 == "-" }):
                 replacePrevious(1, with: "\u{2192}"); return
             case ">" where config.smartArrows && prev == "=" && prev2 != "=":
                 replacePrevious(1, with: "\u{21D2}"); return
@@ -240,12 +298,12 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
                 replacePrevious(1, with: "\u{2190}"); return
             default: break
             }
-            if config.autoCapitalize, let c = typed.first, c.isLowercase, isSentenceStart(at: loc, linePrefix: linePrefix) {
-                super.insertText(typed.uppercased(), replacementRange: sel); return
+            if config.autoCapitalize, let c = typed.first, c.isLowercase, isSentenceStart(at: loc, linePrefix: unescapedPrefix) {
+                commit(typed.uppercased(), replacing: sel); return
             }
         }
 
-        super.insertText(string, replacementRange: replacementRange)
+        commit(literal, replacing: replacementRange.location != NSNotFound ? replacementRange : selectedRange())
 
         if typed == "/" && linePrefix.trimmingCharacters(in: .whitespaces).isEmpty && !inCode {
             events?.textView(self, didBeginSlashAt: loc)
@@ -267,7 +325,8 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     // MARK: Lists
 
     /// Continues Markdown lists / quotes on Return, or ends the list when the item is empty.
-    private func continueListOnNewline() -> Bool {
+    /// `closers` / `openers` close and reopen the inline spans the break cuts through.
+    func continueListOnNewline(closers: String = "", openers: String = "") -> Bool {
         let sel = selectedRange()
         guard sel.length == 0 else { return false }
         let ns = string as NSString
@@ -301,8 +360,9 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             replace(NSRange(location: lineRange.location, length: lineLen), with: "", caret: lineRange.location)
             return true
         }
-        replace(sel, with: "\n" + prefix, caret: sel.location + 1 + (prefix as NSString).length)
-        renumberList(after: sel.location + 1)
+        let head = (closers as NSString).length
+        replace(sel, with: closers + "\n" + prefix + openers, caret: sel.location + head + 1 + (prefix as NSString).length + (openers as NSString).length)
+        renumberList(after: sel.location + head + 1)
         return true
     }
 
@@ -363,6 +423,8 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     // MARK: Editing helpers (undoable)
 
     func replace(_ range: NSRange, with text: String, caret: Int?, select: NSRange? = nil) {
+        programmaticDepth += 1
+        defer { programmaticDepth -= 1 }
         guard shouldChangeText(in: range, replacementString: text) else { return }
         textStorage?.replaceCharacters(in: range, with: text)
         didChangeText()
@@ -452,7 +514,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     /// Lines inside fenced code, images, dividers and table dividers take no inline formatting.
-    private func isFormattableLine(_ line: NSRange) -> Bool {
+    func isFormattableLine(_ line: NSRange) -> Bool {
         guard let s = textStorage, line.length > 0 else { return false }
         if s.attribute(.typeCodeBlock, at: line.location, effectiveRange: nil) != nil { return false }
         if s.attribute(.typeAtomic, at: line.location, effectiveRange: nil) != nil { return false }
@@ -467,36 +529,48 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         let line = contentLineRange(at: location)
         guard isFormattableLine(line) || line.length == 0 else { NSSound.beep(); return }
         let text = (string as NSString).substring(with: line)
-        let active = InlineFormatter.isActive(format, in: text, segment: NSRange(location: location - line.location, length: 0))
+        let probe = closingRun(at: location)?.inner ?? location
+        let active = InlineFormatter.isActive(format, in: text, segment: NSRange(location: probe - line.location, length: 0))
         pendingFormats[format] = !active
     }
 
     /// Types `typed` with the pending formats: wrapped in new markers, or
     /// stepped outside the closing markers of a format being turned off.
-    private func insertWithPendingFormats(_ typed: String) -> Bool {
+    private func insertWithPendingFormats(_ text: String, typed: String) -> Bool {
         let sel = selectedRange()
         guard !pendingFormats.isEmpty else { return false }
-        guard sel.length == 0, sel.location == pendingFormatLocation else { pendingFormats = [:]; return false }
+        guard sel.length == 0, sel.location == pendingFormatLocation, !text.contains("\n") else { pendingFormats = [:]; return false }
         var loc = sel.location
         var on = Set(pendingFormats.filter { $0.value }.keys)
         let off = Set(pendingFormats.filter { !$0.value }.keys)
         pendingFormats = [:]
+        var exited = false
         for format in off {
-            if let exit = exitPoint(of: format, at: loc) { loc = exit.location; on.formUnion(exit.reopen) }
+            if let exit = exitPoint(of: format, at: closingRun(at: loc)?.inner ?? loc) { loc = exit.location; exited = true; on.formUnion(exit.reopen) }
         }
         on.subtract(off)
         let ns = string as NSString
-        let typedLength = (typed as NSString).length
-        if on.isEmpty {
-            guard loc != sel.location else { return false }
-            replace(NSRange(location: loc, length: 0), with: typed, caret: loc + typedLength)
+        let typedLength = (text as NSString).length
+        if (typed == " " || typed == "\t") && !on.isEmpty {
+            // Markers can't hug a space: it goes in plain and the formats wait for the next character.
+            replace(NSRange(location: loc, length: 0), with: typed, caret: loc + 1)
+            pendingFormats = Dictionary(uniqueKeysWithValues: on.map { ($0, true) })
+            pendingFormatLocation = loc + 1
             return true
         }
-        let before: unichar? = loc > 0 ? ns.character(at: loc - 1) : nil
-        let after: unichar? = loc < ns.length ? ns.character(at: loc) : nil
-        let (open, close) = InlineFormatter.wrap(typed, in: on, before: before, after: after)
-        replace(NSRange(location: loc, length: 0), with: open + typed + close, caret: loc + (open as NSString).length + typedLength)
+        if on.isEmpty {
+            guard exited else { return false }
+            replace(NSRange(location: loc, length: 0), with: text, caret: loc + typedLength)
+            return true
+        }
+        insertWrapped(text, formats: on, at: loc)
         return true
+    }
+
+    /// Puts the caret exactly at `location`, even in the middle of a run of hidden markers
+    /// (used to break a line between two touching spans).
+    func placeCaretExactly(_ location: Int) {
+        super.setSelectedRanges([NSValue(range: NSRange(location: location, length: 0))], affinity: .downstream, stillSelecting: false)
     }
 
     /// Where to type so new text falls outside `format`'s span around the caret.
@@ -605,12 +679,13 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
+        events?.textViewWillMouseDown(self)
         let point = convert(event.locationInWindow, from: nil)
         if event.modifierFlags.contains(.command), let url = link(at: point) {
             NSWorkspace.shared.open(url)
             return
         }
-        if config?.hideSyntax == true, let box = taskBox(at: point) {
+        if let box = taskBox(at: point) {
             toggleTask(at: box)
             return
         }
@@ -683,11 +758,11 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     func layoutManager(_ layoutManager: NSLayoutManager, didCompleteLayoutFor textContainer: NSTextContainer?, atEnd layoutFinishedFlag: Bool) {
-        scheduleImageLayout()
+        scheduleImageLayout(textChanged: false)
         scheduleCaretUpdate(animated: false)
     }
 
-    private func isHidden(_ i: Int) -> Bool {
+    func isHidden(_ i: Int) -> Bool {
         guard let s = textStorage, i >= 0, i < s.length else { return false }
         return s.attribute(.typeHidden, at: i, effectiveRange: nil) != nil
     }
@@ -700,12 +775,16 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     /// Keeps the caret out of the middle of hidden syntax, and after hidden line prefixes.
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
         var ranges = ranges
+        if ranges.count == 1, let r = ranges.first?.rangeValue, r.length > 0 {
+            let whole = expandedOverAtomicLines(r)
+            if whole != r { ranges = [NSValue(range: whole)] }
+        }
         if ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0, r.location <= (string as NSString).length {
             let old = selectedRange().location
             let loc = snapOutOfAtomicLines(r.location, forward: r.location >= old)
             if loc != r.location { ranges = [NSValue(range: NSRange(location: loc, length: 0))] }
         }
-        if config?.hideSyntax == true, ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0 {
+        if ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0 {
             let old = selectedRange().location
             var loc = r.location
             let ns = string as NSString
@@ -718,8 +797,12 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             }
             if loc != r.location { ranges = [NSValue(range: NSRange(location: loc, length: 0))] }
         }
+        if ranges.count == 1, let r = ranges.first?.rangeValue, let fixed = keepingEscapesWhole(r, movingForward: r.location >= selectedRange().location), fixed != r {
+            ranges = [NSValue(range: fixed)]
+        }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
         if let r = ranges.first?.rangeValue, r.length > 0 || r.location != pendingFormatLocation { pendingFormats = [:] }
+        if let r = ranges.first?.rangeValue, r.length > 0 || r.location != rejoin?.location { rejoin = nil }
         updateImageSelection()
         scheduleCaretUpdate(animated: !stillSelecting && NSApp.currentEvent?.type == .keyDown)
     }
@@ -734,6 +817,16 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
               let raw = s.attribute(.typeAtomic, at: line.location, effectiveRange: nil) as? String,
               let kind = AtomicKind(rawValue: raw) else { return nil }
         return (line, kind)
+    }
+
+    /// `range` grown to cover every atomic line it only partly covers, so a
+    /// delete, cut or overtype never leaves half an image, rule, fence or divider.
+    /// A range that merely touches a line's boundary is left alone.
+    func expandedOverAtomicLines(_ range: NSRange) -> NSRange {
+        var start = range.location, end = NSMaxRange(range)
+        if let a = atomicLine(at: start), start > a.range.location, start < NSMaxRange(a.range) { start = a.range.location }
+        if let a = atomicLine(at: end), end > a.range.location, end < NSMaxRange(a.range) { end = NSMaxRange(a.range) }
+        return NSRange(location: start, length: end - start)
     }
 
     /// Moves a caret position off atomic lines: to the next line when moving
@@ -843,11 +936,17 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     /// Backspace that respects hidden markers: never silently deletes syntax.
     override func deleteBackward(_ sender: Any?) {
+        userEditDepth += 1
+        defer { userEditDepth -= 1 }
         let sel = selectedRange()
         if deleteSelectedAtomicLine(sel) { return }
         if sel.length == 0, backspaceAfterAtomicLine(at: sel.location) { return }
         if sel.length == 0, stepOverTablePipe(backward: true, at: sel.location) { return }
-        guard config?.hideSyntax == true, sel.length == 0, sel.location > 0 else {
+        if sel.length == 0, sel.location >= 2, isEscapeBackslash(sel.location - 2) {
+            replace(NSRange(location: sel.location - 2, length: 2), with: "", caret: sel.location - 2)
+            return
+        }
+        guard sel.length == 0, sel.location > 0 else {
             let ghost = sel.length == 0 && sel.location > 0 ? captureGhost(of: (string as NSString).rangeOfComposedCharacterSequence(at: sel.location - 1)) : nil
             super.deleteBackward(sender)
             if let ghost { caretOverlay.fadeOutGhost(ghost.image, frame: ghost.frame) }
@@ -866,7 +965,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             while loc > 0 && isHidden(loc - 1) { loc -= 1 }
             guard loc > 0 else { return }
             if isHiddenPrefix(loc - 1) { super.setSelectedRanges([NSValue(range: NSRange(location: loc, length: 0))], affinity: .downstream, stillSelecting: false); deleteBackward(sender); return }
-            let target = ns.rangeOfComposedCharacterSequence(at: loc - 1)
+            let target = isEscapeBackslash(loc - 2) ? NSRange(location: loc - 2, length: 2) : ns.rangeOfComposedCharacterSequence(at: loc - 1)
             let ghost = captureGhost(of: target)
             replace(target, with: "", caret: target.location)
             if let ghost { caretOverlay.fadeOutGhost(ghost.image, frame: ghost.frame) }
@@ -878,10 +977,25 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     override func deleteForward(_ sender: Any?) {
+        userEditDepth += 1
+        defer { userEditDepth -= 1 }
         let sel = selectedRange()
         if deleteSelectedAtomicLine(sel) { return }
         if sel.length == 0, deleteForwardBeforeAtomicLine(at: sel.location) { return }
         if sel.length == 0, stepOverTablePipe(backward: false, at: sel.location) { return }
+        if sel.length == 0, isEscapeBackslash(sel.location) {
+            replace(NSRange(location: sel.location, length: 2), with: "", caret: sel.location)
+            return
+        }
+        if sel.length == 0, isHidden(sel.location) {
+            // Forward-delete never eats half a marker: it removes the first drawn character after the hidden run.
+            let ns = string as NSString
+            var end = sel.location
+            while isHidden(end), !isEscapeBackslash(end) { end += 1 }
+            guard end < ns.length else { return }
+            replace(isEscapeBackslash(end) ? NSRange(location: end, length: 2) : ns.rangeOfComposedCharacterSequence(at: end), with: "", caret: sel.location)
+            return
+        }
         super.deleteForward(sender)
     }
 
@@ -943,7 +1057,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
-        guard config?.hideSyntax == true, let lm = layoutManager else { return }
+        guard let lm = layoutManager else { return }
         let visible = visibleCharacterRange()
 
         // Quote bars
@@ -994,7 +1108,11 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         resolveImageURL(path).flatMap { ImageCache.shared.image(at: $0) }
     }
 
-    func scheduleImageLayout() {
+    /// Repositions the image views after the current event (coalesced).
+    /// `textChanged` rescans the document for images; layout- and scroll-driven
+    /// calls pass false and only reposition the known ones.
+    func scheduleImageLayout(textChanged: Bool = true) {
+        imageRunsStale = imageRunsStale || textChanged
         guard !imageLayoutScheduled else { return }
         imageLayoutScheduled = true
         DispatchQueue.main.async { [weak self] in
@@ -1005,7 +1123,14 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     func layoutImageViews() {
         guard let storage = textStorage, let lm = layoutManager else { return }
-        let runs = attributeRuns(.typeImage, in: NSRange(location: 0, length: storage.length))
+        if imageRunsStale {
+            imageRunsStale = false
+            imageRuns = attributeRuns(.typeImage, in: NSRange(location: 0, length: storage.length)).compactMap { range, value in
+                (value as? ImageSpec).map { (range, $0) }
+            }
+            for v in imageViews { v.invalidateConfiguration() }
+        }
+        let runs = imageRuns
         while imageViews.count < runs.count {
             let v = ImageBlockView(frame: .zero)
             v.textView = self
@@ -1013,10 +1138,9 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             imageViews.append(v)
         }
         while imageViews.count > runs.count { imageViews.removeLast().removeFromSuperview() }
-        for (i, (range, value)) in runs.enumerated() {
-            guard let spec = value as? ImageSpec else { continue }
+        for (i, (range, spec)) in runs.enumerated() {
             let view = imageViews[i]
-            view.configure(image: image(for: spec.path), spec: spec, range: range)
+            if !view.isConfigured { view.configure(image: image(for: spec.path), spec: spec, range: range) }
             let g = lm.glyphIndexForCharacter(at: range.location)
             let frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
             let size = spec.displaySize
@@ -1078,6 +1202,34 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             return
         }
         super.paste(sender)
+    }
+
+    override func pasteAsPlainText(_ sender: Any?) { paste(sender) }
+    override func pasteAsRichText(_ sender: Any?) { paste(sender) }
+
+    override var writablePasteboardTypes: [NSPasteboard.PasteboardType] { [.string, Self.markdownType] }
+
+    /// Copies the Markdown as written (for pasting back into Type) and, as plain text, what is shown.
+    override func writeSelection(to pboard: NSPasteboard, types: [NSPasteboard.PasteboardType]) -> Bool {
+        let range = selectedRange()
+        guard range.length > 0 else { return false }
+        pboard.declareTypes([.string, Self.markdownType], owner: nil)
+        pboard.setString(visibleText(in: range), forType: .string)
+        pboard.setString((string as NSString).substring(with: range), forType: Self.markdownType)
+        return true
+    }
+
+    /// Text from other apps is literal; text copied in Type keeps its formatting.
+    override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        let raw = pboard.string(forType: Self.markdownType)
+        guard config != nil, let text = raw ?? pboard.string(forType: .string) else {
+            return super.readSelection(from: pboard, type: type)
+        }
+        let range = selectedRange()
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        let inserted = raw != nil ? normalized : literalText(normalized, replacing: range)
+        replace(range, with: inserted, caret: range.location + (inserted as NSString).length)
+        return true
     }
 
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
@@ -1200,8 +1352,38 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
         let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+        if ok, undoManager?.isUndoing != true, undoManager?.isRedoing != true, !hasMarkedText() {
+            strayBaseline = strayMarkersOfLine(at: affectedCharRange.location)
+            blockBaseline = blockBaselineBefore(affectedCharRange)
+            if replacementString?.isEmpty ?? true { emptySpanCheck = affectedCharRange.location }
+        }
         if ok, let replacementString, !fades.isEmpty { shiftFades(for: affectedCharRange, newLength: (replacementString as NSString).length) }
         return ok
+    }
+
+    override func shouldChangeText(inRanges affectedRanges: [NSValue], replacementStrings: [String]?) -> Bool {
+        let ok = super.shouldChangeText(inRanges: affectedRanges, replacementStrings: replacementStrings)
+        if ok, affectedRanges.count == 1, undoManager?.isUndoing != true, undoManager?.isRedoing != true, !hasMarkedText() {
+            strayBaseline = strayMarkersOfLine(at: affectedRanges[0].rangeValue.location)
+            blockBaseline = blockBaselineBefore(affectedRanges[0].rangeValue)
+            if replacementStrings?.allSatisfy({ $0.isEmpty }) ?? true { emptySpanCheck = affectedRanges[0].rangeValue.location }
+        }
+        return ok
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        let baseline = strayBaseline
+        strayBaseline = nil
+        let blockBefore = blockBaseline
+        blockBaseline = nil
+        if let at = emptySpanCheck {
+            emptySpanCheck = nil
+            repairSpans(near: at)
+        }
+        if let baseline, !healingSuspended { healLine(afterEditWithStrays: baseline) }
+        if let blockBefore, programmaticDepth == 0 || userEditDepth > 0 { keepNewBlockSyntaxLiteral(wasBlock: blockBefore) }
+
     }
 
     /// Keeps in-flight fades on their characters as text before them changes.
@@ -1280,6 +1462,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         }
         fades = []
         pendingFormats = [:]
+        rejoin = nil
     }
 
     /// An image of the glyphs in `range`, for fading out after they're
@@ -1348,7 +1531,9 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             }
             return
         }
-        let current = ns.paragraphRange(for: NSRange(location: min(selectedRange().location, ns.length), length: selectedRange().length))
+        var current = ns.paragraphRange(for: NSRange(location: min(selectedRange().location, ns.length), length: selectedRange().length))
+        // A table is one block: its other rows stay readable while a cell is edited.
+        if let table = tableContext(at: min(selectedRange().location, ns.length)) { current = NSUnionRange(current, ns.paragraphRange(for: table.block)) }
         guard force || current != focusedParagraph else { return }
         focusedParagraph = current
         lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: full)
@@ -1360,5 +1545,33 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             lm.addTemporaryAttribute(.foregroundColor, value: dim, forCharacterRange: NSRange(location: NSMaxRange(current), length: ns.length - NSMaxRange(current)))
         }
         applyFades()
+    }
+}
+
+
+/// Layout manager that never paints the text-selection highlight behind an
+/// image or divider line (those draw their own selection ring / accent).
+final class TypeLayoutManager: NSLayoutManager {
+    override func fillBackgroundRectArray(_ rectArray: UnsafePointer<NSRect>, count rectCount: Int, forCharacterRange charRange: NSRange, color: NSColor) {
+        guard let s = textStorage, charRange.length > 0, charRange.location < s.length else {
+            return super.fillBackgroundRectArray(rectArray, count: rectCount, forCharacterRange: charRange, color: color)
+        }
+        var skipped: [NSRect] = []
+        let ns = s.string as NSString
+        var loc = charRange.location
+        while loc < NSMaxRange(charRange) {
+            let line = ns.lineRange(for: NSRange(location: loc, length: 0))
+            loc = NSMaxRange(line)
+            guard let raw = s.attribute(.typeAtomic, at: line.location, effectiveRange: nil) as? String,
+                  let kind = AtomicKind(rawValue: raw), kind == .image || kind == .rule else { continue }
+            let g = glyphIndexForCharacter(at: line.location)
+            skipped.append(lineFragmentRect(forGlyphAt: g, effectiveRange: nil))
+        }
+        guard !skipped.isEmpty else { return super.fillBackgroundRectArray(rectArray, count: rectCount, forCharacterRange: charRange, color: color) }
+        let kept = UnsafeBufferPointer(start: rectArray, count: rectCount).filter { rect in !skipped.contains { $0.minY <= rect.midY && rect.midY <= $0.maxY } }
+        kept.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress, !buffer.isEmpty else { return }
+            super.fillBackgroundRectArray(base, count: buffer.count, forCharacterRange: charRange, color: color)
+        }
     }
 }

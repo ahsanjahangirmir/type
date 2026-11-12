@@ -2,6 +2,8 @@ import SwiftUI
 import AppKit
 
 struct SettingsView: View {
+    @EnvironmentObject private var settings: AppSettings
+
     var body: some View {
         TabView {
             Tab("General", systemImage: "gearshape") { GeneralSettings() }
@@ -12,6 +14,7 @@ struct SettingsView: View {
         }
         .frame(width: 520)
         .scenePadding()
+        .preferredColorScheme(settings.appearance.colorScheme)
     }
 }
 
@@ -121,12 +124,7 @@ private struct TypographySettings: View {
                     ForEach(WritingDirection.allCases) { Text($0.label).tag($0) }
                 }
             }
-            Section("Markup") {
-                Toggle("Hide Markdown syntax", isOn: $settings.hideSyntax)
-                Text("Shows formatting without the raw **, ## and > markers. Use the toolbar, menus or shortcuts to format.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Toggle("Dim Markdown syntax", isOn: $settings.dimSyntax)
-                    .disabled(settings.hideSyntax)
+            Section("Comments") {
                 Picker("Comment color", selection: $settings.commentTint) {
                     ForEach(CommentTint.allCases) { tint in
                         Label { Text(tint.label) } icon: { Image(systemName: "circle.fill").foregroundStyle(Color(nsColor: tint.nsColor)) }

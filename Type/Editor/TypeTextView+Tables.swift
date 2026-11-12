@@ -104,7 +104,7 @@ extension TypeTextView {
     }
 
     private func appendTableRow(after index: Int, in table: TableContext) {
-        let columns = max(1, tableCells(in: table.rows[0]).count)
+        let columns = max(1, table.rows.map { tableCells(in: $0).count }.max() ?? 1)
         let row = "|" + String(repeating: "   |", count: columns)
         let at = NSMaxRange(table.rows[index])
         replace(NSRange(location: at, length: 0), with: "\n" + row, caret: at + 3)
@@ -115,7 +115,7 @@ extension TypeTextView {
     func stepOverTablePipe(backward: Bool, at location: Int) -> Bool {
         let ns = string as NSString
         let i = backward ? location - 1 : location
-        guard i >= 0, i < ns.length, ns.character(at: i) == 124, let table = tableContext(at: location) else { return false }
+        guard i >= 0, i < ns.length, ns.character(at: i) == 124, !isEscapeBackslash(i - 1), let table = tableContext(at: location) else { return false }
         guard table.rows.contains(where: { NSLocationInRange(i, $0) }) else { return false }
         setSelectedRange(NSRange(location: backward ? i : i + 1, length: 0))
         return true
@@ -209,12 +209,15 @@ extension TypeTextView {
     // MARK: Drawing
 
     /// Draws a hidden-syntax table as a grid: rounded outline, a tinted header
-    /// and hairlines between rows and columns (at the invisible pipes).
+    /// and hairlines between rows and columns (at the invisible pipes). The
+    /// grid spans the widest row (shorter rows end in empty cells) and stops
+    /// at the text column when the table is wider than it.
     func drawTableGrid(_ table: NSRange) {
-        guard let lm = layoutManager, let s = textStorage, NSMaxRange(table) <= s.length else { return }
+        guard let lm = layoutManager, let s = textStorage, let tc = textContainer, let config, NSMaxRange(table) <= s.length else { return }
         let ns = string as NSString
         var rows: [NSRect] = []
         var columns: [CGFloat] = []
+        var columnsRowIsClosed = false
         var loc = table.location
         while loc < NSMaxRange(table) {
             let line = contentLineRange(at: loc)
@@ -222,26 +225,37 @@ extension TypeTextView {
             defer { loc = next > loc ? next : NSMaxRange(table) }
             guard line.length > 0, s.attribute(.typeAtomic, at: line.location, effectiveRange: nil) == nil else { continue }
             let g = lm.glyphIndexForCharacter(at: line.location)
-            let frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+            let frag = lm.lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil)
             rows.append(frag.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y))
-            if rows.count == 1 {
-                for p in MarkdownStyler.pipes(in: ns.substring(with: line)) {
-                    let pg = lm.glyphIndexForCharacter(at: line.location + p)
-                    let font = (s.attribute(.font, at: line.location + p, effectiveRange: nil) as? NSFont) ?? .systemFont(ofSize: 14)
-                    let pipeWidth = ("|" as NSString).size(withAttributes: [.font: font]).width
-                    columns.append((frag.minX + lm.location(forGlyphAt: pg).x + pipeWidth / 2 + textContainerOrigin.x).rounded())
-                }
+            let text = ns.substring(with: line)
+            let pipes = MarkdownStyler.pipes(in: text)
+            let closed = pipes.last.map { (text as NSString).substring(from: $0 + 1).allSatisfy { $0 == " " || $0 == "\t" } } ?? false
+            // The row with the most borders defines the columns (a closed row wins a tie).
+            guard pipes.count > columns.count || (pipes.count == columns.count && closed && !columnsRowIsClosed) else { continue }
+            columnsRowIsClosed = closed
+            columns = pipes.map { p in
+                let pg = lm.glyphIndexForCharacter(at: line.location + p)
+                let font = (s.attribute(.font, at: line.location + p, effectiveRange: nil) as? NSFont) ?? .systemFont(ofSize: 14)
+                let pipeWidth = ("|" as NSString).size(withAttributes: [.font: font]).width
+                return (lm.lineFragmentRect(forGlyphAt: pg, effectiveRange: nil).minX + lm.location(forGlyphAt: pg).x + pipeWidth / 2 + textContainerOrigin.x).rounded()
             }
         }
-        guard let first = rows.first, let last = rows.last, columns.count >= 2 else { return }
-        let rect = NSRect(x: columns.first!, y: first.minY.rounded(), width: columns.last! - columns.first!, height: (last.maxY - first.minY).rounded())
+        let limit = (textContainerOrigin.x + tc.size.width).rounded()
+        columns = columns.filter { $0 <= limit }
+        guard let firstRow = rows.first, let lastRow = rows.last, columns.count >= 2 else { return }
+        let pad = MarkdownStyler.tableRowPadding(fontSize: config.fontSize)
+        let top = (firstRow.minY - pad).rounded()
+        let bottom = (lastRow.maxY + pad).rounded()
+        // Hairlines sit halfway between the text of neighbouring rows.
+        let lines = zip(rows, rows.dropFirst()).map { (($0.maxY + $1.minY) / 2).rounded() }
+        let rect = NSRect(x: columns.first!, y: top, width: columns.last! - columns.first!, height: bottom - top)
         let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
         NSGraphicsContext.saveGraphicsState()
         outline.addClip()
         NSColor.labelColor.withAlphaComponent(0.05).setFill()
-        NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: first.maxY - rect.minY).fill()
+        NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: (lines.first ?? rect.maxY) - rect.minY).fill()
         NSColor.separatorColor.setFill()
-        for row in rows.dropLast() { NSRect(x: rect.minX, y: row.maxY.rounded() - 0.5, width: rect.width, height: 1).fill() }
+        for y in lines { NSRect(x: rect.minX, y: y - 0.5, width: rect.width, height: 1).fill() }
         for x in columns.dropFirst().dropLast() { NSRect(x: x - 0.5, y: rect.minY, width: 1, height: rect.height).fill() }
         NSGraphicsContext.restoreGraphicsState()
         NSColor.separatorColor.setStroke()

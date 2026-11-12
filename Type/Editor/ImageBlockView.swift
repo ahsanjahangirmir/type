@@ -13,6 +13,8 @@ final class ImageBlockView: NSView {
     private let edgeHandle = ImageBlockView.makeHandle()
     private let cornerHandle = ImageBlockView.makeHandle()
     private let sizeBadge = ImageBlockView.makeBadge()
+    private let placeholder = NSView()
+    private let placeholderLabel = NSTextField(labelWithString: "")
     private var tracking: NSTrackingArea?
     private var hovering = false { didSet { updateChrome() } }
     var isSelected = false { didSet { if isSelected != oldValue { updateChrome() } } }
@@ -48,23 +50,43 @@ final class ImageBlockView: NSView {
         ringLayer.isHidden = true
         layer?.addSublayer(ringLayer)
 
+        configurePlaceholder()
+        addSubview(placeholder)
         for v in [edgeHandle, cornerHandle, sizeBadge] {
             v.isHidden = true
             addSubview(v)
         }
         toolTip = nil
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// False until `configure` runs again after `invalidateConfiguration`.
+    private(set) var isConfigured = false
+    func invalidateConfiguration() { isConfigured = false }
+
     func configure(image: NSImage?, spec: ImageSpec, range: NSRange) {
+        isConfigured = true
         self.spec = spec
         sourceRange = range
-        if let image, imageLayer.contents as? NSImage !== image {
-            imageLayer.contents = image
-            aspect = image.size.width > 0 ? image.size.height / image.size.width : 1
+        let fileName = ((spec.path.removingPercentEncoding ?? spec.path) as NSString).lastPathComponent
+        if let image {
+            if imageLayer.contents as? NSImage !== image {
+                imageLayer.contents = image
+                aspect = image.size.width > 0 ? image.size.height / image.size.width : 1
+            }
+        } else {
+            // Views are reused for different images: never keep showing a previous one.
+            imageLayer.contents = nil
+            placeholderLabel.stringValue = fileName
         }
+        placeholder.isHidden = image != nil
+        updateChrome()
         toolTip = spec.alt.isEmpty ? nil : spec.alt
+        let label = spec.alt.isEmpty ? fileName : spec.alt
+        setAccessibilityLabel(image == nil ? "Missing image: \(label)" : label)
     }
 
     override func layout() {
@@ -72,6 +94,7 @@ final class ImageBlockView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         imageLayer.frame = bounds
+        placeholder.frame = bounds
         ringLayer.frame = bounds.insetBy(dx: -4, dy: -4)
         layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: Self.radius, cornerHeight: Self.radius, transform: nil)
         CATransaction.commit()
@@ -89,6 +112,7 @@ final class ImageBlockView: NSView {
     private func updateChrome() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             imageLayer.borderColor = NSColor.separatorColor.cgColor
+            imageLayer.backgroundColor = imageLayer.contents == nil ? NSColor.secondaryLabelColor.withAlphaComponent(0.08).cgColor : nil
             ringLayer.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor
         }
         ringLayer.isHidden = !isSelected
@@ -186,6 +210,28 @@ final class ImageBlockView: NSView {
     }
 
     // MARK: Chrome factories
+
+    /// What stands in for an image whose file can't be found: a symbol and the file name.
+    private func configurePlaceholder() {
+        let icon = NSImageView(image: NSImage(systemSymbolName: "photo", accessibilityDescription: nil) ?? NSImage())
+        icon.symbolConfiguration = .init(pointSize: 28, weight: .light)
+        icon.contentTintColor = .secondaryLabelColor
+        placeholderLabel.font = .systemFont(ofSize: 12)
+        placeholderLabel.textColor = .secondaryLabelColor
+        placeholderLabel.lineBreakMode = .byTruncatingMiddle
+        let stack = NSStackView(views: [icon, placeholderLabel])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        placeholder.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: placeholder.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: placeholder.centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: placeholder.leadingAnchor, constant: 12),
+        ])
+        placeholder.isHidden = true
+    }
 
     private static func makeHandle() -> NSGlassEffectView {
         let v = NSGlassEffectView()

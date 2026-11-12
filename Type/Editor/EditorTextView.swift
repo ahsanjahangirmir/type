@@ -110,6 +110,8 @@ struct EditorTextView: NSViewRepresentable {
         }
         // External change (revert, versions browser, etc.)
         if !coordinator.isEditing && tv.string != text {
+            // The old undo steps refer to text that is gone; replaying them would hit the wrong offsets.
+            tv.undoManager?.removeAllActions()
             coordinator.load(text, into: tv)
         }
     }
@@ -256,7 +258,10 @@ struct EditorTextView: NSViewRepresentable {
             tv.refreshFocusDimming()
             Task { @MainActor in
                 let c = self.parent.controller
-                if let slash = c.slash, tv.selectedRange().location <= slash.anchor { c.cancelSlash() }
+                if let slash = c.slash {
+                    if slash.format != nil { c.updateSlash() } // closes the Format menu once the selection differs
+                    else if tv.selectedRange().location <= slash.anchor { c.cancelSlash() }
+                }
                 c.updateCurrentHeading()
             }
             if NSApp.currentEvent?.type == .keyDown { tv.centerCaretIfNeeded() }
@@ -300,12 +305,13 @@ struct EditorTextView: NSViewRepresentable {
 
         // MARK: TypeTextViewEvents
 
+        // Events arrive on the main thread in order, so handle them synchronously.
         func textViewDidType(_ textView: TypeTextView) {
-            Task { @MainActor in self.parent.controller.userTyped() }
+            MainActor.assumeIsolated { parent.controller.userTyped() }
         }
 
         func textViewMouseMoved(_ textView: TypeTextView) {
-            Task { @MainActor in self.parent.controller.mouseMoved() }
+            MainActor.assumeIsolated { parent.controller.mouseMoved() }
         }
 
         func textView(_ textView: TypeTextView, didBeginSlashAt location: Int) {
@@ -314,6 +320,14 @@ struct EditorTextView: NSViewRepresentable {
 
         func textView(_ textView: TypeTextView, handleSlashCommand selector: Selector) -> Bool {
             MainActor.assumeIsolated { parent.controller.handleSlashKey(selector) }
+        }
+
+        func textView(_ textView: TypeTextView, handleTypedText typed: String) -> Bool {
+            MainActor.assumeIsolated { parent.controller.handleTypedText(typed) }
+        }
+
+        func textViewWillMouseDown(_ textView: TypeTextView) {
+            MainActor.assumeIsolated { if parent.controller.slash?.format != nil { parent.controller.cancelSlash() } }
         }
     }
 }

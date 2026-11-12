@@ -7,6 +7,13 @@ struct SlashState: Equatable {
     var query: String = ""
     var rect: CGRect = .zero // caret rect in editor (top-left origin) coordinates
     var selection = 0
+    /// Set for the Format menu: the text selection it applies to (`anchor` and `query` then mean nothing
+    /// to the text; the query filters the list only).
+    var format: NSRange?
+    /// Format menu: top line of the selection, where the menu goes when it flips above (`rect` is the last line).
+    var aboveRect: CGRect?
+    /// Format menu: inline formats the whole selection already has (checkmarked), worked out once on opening.
+    var active: Set<InlineFormat> = []
 }
 
 struct SlashCommand: Identifiable {
@@ -15,6 +22,9 @@ struct SlashCommand: Identifiable {
     let subtitle: String
     let symbol: String
     let keywords: [String]
+    /// Format menu: key equivalent shown beside the title, and the inline format whose active state gets a checkmark.
+    var shortcut: String? = nil
+    var format: InlineFormat? = nil
     let run: (EditorController, NSRange) -> Void
 }
 
@@ -38,17 +48,25 @@ final class EditorController: ObservableObject {
     var title: String { fileURL?.deletingPathExtension().lastPathComponent ?? "Untitled" }
 
     private var analysisTask: Task<Void, Never>?
+    /// Closes the Format menu when the editor scrolls away from the selection it was opened on.
+    var formatScrollObserver: NSObjectProtocol?
+    private var chrome = ChromeVisibility()
 
     // MARK: Activity
 
+    /// Hides the chrome on a keystroke (once; repeated keys don't re-run the animation).
     func userTyped() {
-        if chromeVisible, AppSettings.shared.autoHideChrome {
-            withAnimation(.smooth(duration: 0.35)) { chromeVisible = false }
-        }
+        guard AppSettings.shared.autoHideChrome else { return }
+        guard chrome.hide(at: ProcessInfo.processInfo.systemUptime) else { return }
+        withAnimation(.smooth(duration: 0.35)) { chromeVisible = false }
     }
 
+    /// Shows the chrome only for real pointer movement (see `ChromeVisibility`).
+    /// Reads the screen position, so it is safe to call from hover and mouse-move
+    /// callbacks that fire while the content shifts under a still pointer.
     func mouseMoved() {
-        if !chromeVisible { withAnimation(.smooth(duration: 0.25)) { chromeVisible = true } }
+        guard chrome.pointerMoved(to: NSEvent.mouseLocation, at: ProcessInfo.processInfo.systemUptime) else { return }
+        withAnimation(.smooth(duration: 0.25)) { chromeVisible = true }
     }
 
     // MARK: Analysis
@@ -176,20 +194,26 @@ final class EditorController: ObservableObject {
 
     func reveal(_ item: OutlineItem) {
         guard let tv = textView else { return }
-        let r = NSRange(location: item.location, length: 0)
-        tv.setSelectedRange(r)
+        // The outline can lag behind the text, so its offsets may be past the end.
+        let length = (tv.string as NSString).length
+        let location = min(max(0, item.location), length)
+        tv.setSelectedRange(NSRange(location: location, length: 0))
         tv.window?.makeFirstResponder(tv)
         if let clip = tv.enclosingScrollView?.contentView {
-            let caret = tv.caretRect(at: item.location)
+            let caret = tv.caretRect(at: location)
             let y = max(0, caret.minY - clip.bounds.height * 0.25)
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.3
-                ctx.allowsImplicitAnimation = true
-                clip.animator().setBoundsOrigin(NSPoint(x: 0, y: y))
+            if Motion.reduced {
+                clip.setBoundsOrigin(NSPoint(x: 0, y: y))
+            } else {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.3
+                    ctx.allowsImplicitAnimation = true
+                    clip.animator().setBoundsOrigin(NSPoint(x: 0, y: y))
+                }
             }
             tv.enclosingScrollView?.reflectScrolledClipView(clip)
         }
-        tv.showFindIndicator(for: NSRange(location: item.location, length: min(item.title.utf16.count + item.level + 1, (tv.string as NSString).length - item.location)))
+        tv.showFindIndicator(for: NSRange(location: location, length: min(item.title.utf16.count + item.level + 1, length - location)))
     }
 
     func showFind(replace: Bool = false) {
@@ -224,10 +248,13 @@ final class EditorController: ObservableObject {
     ]
 
     var filteredSlashCommands: [SlashCommand] {
-        guard let q = slash?.query.lowercased(), !q.isEmpty else { return Self.slashCommands }
-        return Self.slashCommands.filter { cmd in
-            cmd.title.lowercased().contains(q) || cmd.keywords.contains { $0.hasPrefix(q) }
-        }
+        filteredCommands(slash?.format != nil ? Self.formatCommands : Self.slashCommands, query: slash?.query ?? "")
+    }
+
+    private func filteredCommands(_ all: [SlashCommand], query: String) -> [SlashCommand] {
+        let q = query.lowercased()
+        guard !q.isEmpty else { return all }
+        return all.filter { $0.title.lowercased().contains(q) || $0.keywords.contains { $0.hasPrefix(q) } }
     }
 
     func beginSlash(at location: Int) {
@@ -239,22 +266,20 @@ final class EditorController: ObservableObject {
 
     func updateSlash() {
         guard var state = slash, let tv = textView else { return }
+        if let selection = state.format {
+            if tv.selectedRange() != selection { cancelSlash() }
+            return
+        }
         let ns = tv.string as NSString
         let caret = tv.selectedRange().location
         guard state.anchor < ns.length, ns.character(at: state.anchor) == 47 /* "/" */, caret > state.anchor else { cancelSlash(); return }
         let query = ns.substring(with: NSRange(location: state.anchor + 1, length: caret - state.anchor - 1))
         if query.contains(where: { $0.isWhitespace }) || query.count > 20 { cancelSlash(); return }
         state.query = query
-        let count = filteredSlashCommandsFor(query).count
+        let count = filteredCommands(Self.slashCommands, query: query).count
         if count == 0 && query.count > 3 { cancelSlash(); return }
         state.selection = min(state.selection, max(0, count - 1))
         slash = state
-    }
-
-    private func filteredSlashCommandsFor(_ q: String) -> [SlashCommand] {
-        let q = q.lowercased()
-        guard !q.isEmpty else { return Self.slashCommands }
-        return Self.slashCommands.filter { $0.title.lowercased().contains(q) || $0.keywords.contains { $0.hasPrefix(q) } }
     }
 
     func cancelSlash() {
@@ -263,6 +288,7 @@ final class EditorController: ObservableObject {
 
     func handleSlashKey(_ selector: Selector) -> Bool {
         guard var state = slash else { return false }
+        if state.format != nil, NSStringFromSelector(selector).hasPrefix("delete") { return backspaceInFormatMenu() }
         let items = filteredSlashCommands
         switch selector {
         case #selector(NSResponder.moveDown(_:)):
@@ -274,6 +300,7 @@ final class EditorController: ObservableObject {
             slash = state
             return true
         case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)):
+            if state.format != nil, items.isEmpty { NSSound.beep(); return true }
             guard !items.isEmpty else { cancelSlash(); return false }
             runSlash(items[state.selection])
             return true
@@ -284,12 +311,20 @@ final class EditorController: ObservableObject {
             cancelSlash()
             return false
         default:
+            // Any other command (selection moves, ⌘A...) leaves the Format menu; the selection stays as the command leaves it.
+            if state.format != nil { cancelSlash() }
             return false
         }
     }
 
     func runSlash(_ command: SlashCommand) {
         guard let state = slash, let tv = textView else { return }
+        if state.format != nil {
+            slash = nil
+            tv.window?.makeFirstResponder(tv)
+            command.run(self, tv.selectedRange())
+            return
+        }
         let caret = tv.selectedRange().location
         let range = NSRange(location: state.anchor, length: max(1, caret - state.anchor))
         slash = nil
@@ -301,7 +336,7 @@ final class EditorController: ObservableObject {
         tv.replace(range, with: text, caret: range.location + (caret ?? (text as NSString).length))
     }
 
-    private func rectInEditor(_ r: NSRect, tv: NSTextView, scroll: NSScrollView) -> CGRect {
+    func rectInEditor(_ r: NSRect, tv: NSTextView, scroll: NSScrollView) -> CGRect {
         let inScroll = tv.convert(r, to: scroll)
         let y = scroll.isFlipped ? inScroll.minY : scroll.bounds.height - inScroll.maxY
         return CGRect(x: inScroll.minX, y: y, width: inScroll.width, height: inScroll.height)

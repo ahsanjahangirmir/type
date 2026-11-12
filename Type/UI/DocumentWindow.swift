@@ -14,6 +14,7 @@ struct DocumentWindow: View {
             .navigationTitle(controller.title)
             .navigationSubtitle(controller.currentHeading?.title ?? "")
             .focusedSceneObject(controller)
+            .focusedSceneValue(\.showOutline, $showOutline)
             .preferredColorScheme(settings.appearance.colorScheme)
     }
 }

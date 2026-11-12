@@ -214,8 +214,6 @@ struct EditorConfig: Equatable {
     var continueLists: Bool
     var typingSounds: Bool
     var commentTint: CommentTint
-    var dimSyntax: Bool
-    var hideSyntax: Bool
     var smoothTyping: Bool
 }
 
@@ -244,8 +242,6 @@ final class AppSettings: ObservableObject {
     @Published var hideCaret = false { didSet { save(hideCaret, "hideCaret") } }
     @Published var selectionColor: SelectionColor = .system { didSet { save(selectionColor.rawValue, "selectionColor") } }
     @Published var selectionCustomHex = "#FF9F0A59" { didSet { save(selectionCustomHex, "selectionCustomHex") } }
-    @Published var dimSyntax = true { didSet { save(dimSyntax, "dimSyntax") } }
-    @Published var hideSyntax = false { didSet { save(hideSyntax, "hideSyntax") } }
     @Published var smoothTyping = true { didSet { save(smoothTyping, "smoothTyping") } }
     @Published var commentTint: CommentTint = .green { didSet { save(commentTint.rawValue, "commentTint") } }
 
@@ -305,8 +301,6 @@ final class AppSettings: ObservableObject {
         load("hideCaret", &hideCaret)
         load("selectionColor", &selectionColor)
         if let hex = store.string(forKey: "selectionCustomHex"), NSColor(hex: hex) != nil { selectionCustomHex = hex }
-        load("dimSyntax", &dimSyntax)
-        load("hideSyntax", &hideSyntax)
         load("smoothTyping", &smoothTyping)
         load("soundProfile", &soundProfile)
         if let path = store.string(forKey: "libraryPath"), !path.isEmpty { libraryPath = (path as NSString).expandingTildeInPath }
@@ -373,8 +367,6 @@ final class AppSettings: ObservableObject {
             continueLists: continueLists,
             typingSounds: typingSounds,
             commentTint: commentTint,
-            dimSyntax: dimSyntax,
-            hideSyntax: hideSyntax,
             smoothTyping: smoothTyping
         )
     }

@@ -81,7 +81,7 @@ struct BlockRanges: Equatable {
 
 /// Live Markdown styling: headings, emphasis, lists, quotes, code, links,
 /// comments and tables are styled in place. Syntax is either shown quietly
-/// or hidden entirely (`hideSyntax`).
+/// hidden entirely.
 final class MarkdownStyler {
     private(set) var config: EditorConfig
     private var fontCache: [String: NSFont] = [:]
@@ -99,8 +99,6 @@ final class MarkdownStyler {
         }
         self.config = config
     }
-
-    private var hide: Bool { config.hideSyntax }
 
     // MARK: Fonts
 
@@ -144,7 +142,7 @@ final class MarkdownStyler {
     // MARK: Colors
 
     var textColor: NSColor { .labelColor }
-    var syntaxColor: NSColor { config.dimSyntax ? .tertiaryLabelColor : .secondaryLabelColor }
+    var syntaxColor: NSColor { .tertiaryLabelColor }
     var accentColor: NSColor { .controlAccentColor }
     var codeBackground: NSColor { NSColor.labelColor.dynamicAlpha(0.06) }
     var commentColor: NSColor { config.commentTint.nsColor }
@@ -180,14 +178,23 @@ final class MarkdownStyler {
     private static let fenceRegex = try! NSRegularExpression(
         pattern: #"^[ \t]*(`{3,}|~{3,})[^\n]*(?:\n(?:[\s\S]*?\n)?[ \t]*\1[ \t]*(?=\n|\z)|[\s\S]*\z)"#,
         options: [.anchorsMatchLines])
-    private static let commentRegex = try! NSRegularExpression(pattern: #"<!--[\s\S]*?(?:-->|\z)"#)
+    private static let commentRegex = try! NSRegularExpression(pattern: #"(?<!\\)<!--[\s\S]*?(?:-->|\z)"#)
 
     static func scanBlocks(_ ns: NSString) -> BlockRanges {
         let all = NSRange(location: 0, length: ns.length)
-        let code = fenceRegex.matches(in: ns as String, range: all).map(\.range)
-        let comments = commentRegex.matches(in: ns as String, range: all).map(\.range)
-            .filter { c in !code.contains { NSIntersectionRange($0, c).length > 0 } }
-        let tables = tableRegex.matches(in: ns as String, range: all).map(\.range).filter { t in
+        // Regex scans of a long document cost milliseconds per keystroke. One pass over
+        // the characters rules out fences and comments, and finds table lines directly.
+        var chars = [unichar](repeating: 0, count: ns.length)
+        ns.getCharacters(&chars, range: all)
+        var hasFence = false, hasComment = false
+        for (i, c) in chars.enumerated() {
+            if c == 0x60 || c == 0x7E { hasFence = true }  // ` ~
+            else if c == 0x3C, i + 3 < chars.count, chars[i + 1] == 0x21, chars[i + 2] == 0x2D, chars[i + 3] == 0x2D { hasComment = true }
+        }
+        let code = hasFence ? fenceRegex.matches(in: ns as String, range: all).map(\.range) : []
+        let comments = hasComment ? commentRegex.matches(in: ns as String, range: all).map(\.range)
+            .filter { c in !code.contains { NSIntersectionRange($0, c).length > 0 } } : []
+        let tables = pipeLineBlocks(chars).filter { t in
             guard !code.contains(where: { NSIntersectionRange($0, t).length > 0 }) else { return false }
             let lines = ns.substring(with: t).components(separatedBy: "\n")
             return lines.count >= 2 && MDPattern.tableDivider.firstMatch(in: lines[1], range: NSRange(location: 0, length: (lines[1] as NSString).length)) != nil
@@ -195,7 +202,29 @@ final class MarkdownStyler {
         return BlockRanges(code: code, comments: comments, tables: tables)
     }
 
-    private static let tableRegex = try! NSRegularExpression(pattern: #"^[ \t]*\|[^\n]*(?:\n[ \t]*\|[^\n]*)*"#, options: [.anchorsMatchLines])
+    /// Runs of consecutive lines whose first non-blank character is `|`
+    /// (without the final newline): the candidates for tables.
+    private static func pipeLineBlocks(_ chars: [unichar]) -> [NSRange] {
+        var blocks: [NSRange] = []
+        var start: Int?, end = 0
+        var i = 0
+        while i < chars.count {
+            var j = i
+            while j < chars.count, chars[j] == 0x20 || chars[j] == 0x09 { j += 1 }
+            var lineEnd = j
+            while lineEnd < chars.count, chars[lineEnd] != 0x0A { lineEnd += 1 }
+            if j < chars.count, chars[j] == 0x7C {
+                if start == nil { start = i }
+                end = lineEnd
+            } else if let s = start {
+                blocks.append(NSRange(location: s, length: end - s))
+                start = nil
+            }
+            i = lineEnd + 1
+        }
+        if let s = start { blocks.append(NSRange(location: s, length: end - s)) }
+        return blocks
+    }
 
     // MARK: Styling
 
@@ -205,6 +234,8 @@ final class MarkdownStyler {
         let full = NSRange(location: 0, length: ns.length)
         var range = requested.map { ns.paragraphRange(for: NSIntersectionRange($0, full)) } ?? full
         if range.location == NSNotFound { range = full }
+        // A list item's spacing depends on the line after it, so restyle the line above too.
+        if range.location > 0 { range = NSUnionRange(range, ns.paragraphRange(for: NSRange(location: range.location - 1, length: 0))) }
         // Column widths depend on every row, so a table is always restyled whole.
         let probe = NSRange(location: max(0, range.location - 1), length: min(full.length - max(0, range.location - 1), range.length + 2))
         let tables = blocks.tables.filter { NSIntersectionRange($0, probe).length > 0 || NSLocationInRange(range.location, $0) }
@@ -226,12 +257,10 @@ final class MarkdownStyler {
                 .typeComment: true,
             ], range: r)
             addTraits(storage, r, italic: true)
-            if hide {
-                if NSLocationInRange(comment.location, range) { hideRange(storage, NSRange(location: comment.location, length: 4)) }
-                let end = NSMaxRange(comment)
-                if comment.length >= 7, ns.substring(with: NSRange(location: end - 3, length: 3)) == "-->", NSLocationInRange(end - 1, range) {
-                    hideRange(storage, NSRange(location: end - 3, length: 3))
-                }
+            if NSLocationInRange(comment.location, range) { hideRange(storage, NSRange(location: comment.location, length: 4)) }
+            let end = NSMaxRange(comment)
+            if comment.length >= 7, ns.substring(with: NSRange(location: end - 3, length: 3)) == "-->", NSLocationInRange(end - 1, range) {
+                hideRange(storage, NSRange(location: end - 3, length: 3))
             }
         }
         storage.endEditing()
@@ -247,13 +276,11 @@ final class MarkdownStyler {
             let isFence = line.location == block.location || ((trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~")) && NSMaxRange(line) >= NSMaxRange(block) - 1)
             if isFence {
                 s.addAttribute(.foregroundColor, value: syntaxColor, range: line)
-                if hide {
-                    hideRange(s, line)
-                    if line.length > 0 { s.addAttribute(.typeAtomic, value: AtomicKind.fence.rawValue, range: line) }
-                    let p = NSMutableParagraphStyle()
-                    p.lineHeightMultiple = 0.45
-                    s.addAttribute(.paragraphStyle, value: p, range: enclosing)
-                }
+                hideRange(s, line)
+                if line.length > 0 { s.addAttribute(.typeAtomic, value: AtomicKind.fence.rawValue, range: line) }
+                let p = NSMutableParagraphStyle()
+                p.lineHeightMultiple = 0.45
+                s.addAttribute(.paragraphStyle, value: p, range: enclosing)
             }
             return
         }
@@ -270,7 +297,7 @@ final class MarkdownStyler {
         let textRange = NSRange(location: 0, length: (text as NSString).length)
         var contentStart = line.location
 
-        // Block images (always rendered, regardless of hideSyntax)
+        // Block images
         if let m = MDPattern.blockImage.firstMatch(in: text, range: textRange), styleImageLine(s, text: text as NSString, match: m, line: line, enclosing: enclosing) {
             return
         }
@@ -293,10 +320,8 @@ final class MarkdownStyler {
         // Horizontal rule
         if MDPattern.rule.firstMatch(in: text, range: textRange) != nil {
             s.addAttributes([.foregroundColor: syntaxColor, .kern: config.fontSize * 0.4], range: line)
-            if hide {
-                hideRange(s, line)
-                s.addAttributes([.typeRule: true, .typeAtomic: AtomicKind.rule.rawValue], range: line)
-            }
+            hideRange(s, line)
+            s.addAttributes([.typeRule: true, .typeAtomic: AtomicKind.rule.rawValue], range: line)
             return
         }
 
@@ -323,16 +348,10 @@ final class MarkdownStyler {
             let markerRange = NSRange(location: line.location, length: m.range.length)
             s.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: line)
             addTraits(s, line, italic: true)
-            if hide {
-                marker(s, markerRange, prefix: true)
-                s.addAttribute(.typeQuoteBar, value: true, range: enclosing)
-                let indent = config.fontSize * 1.1
-                s.addAttribute(.paragraphStyle, value: paragraphStyle(headIndent: indent, firstLineIndent: indent), range: enclosing)
-            } else {
-                s.addAttribute(.foregroundColor, value: accentColor.dynamicAlpha(0.7), range: markerRange)
-                let indent = (ns.substring(with: markerRange) as NSString).size(withAttributes: [.font: font()]).width
-                s.addAttribute(.paragraphStyle, value: paragraphStyle(headIndent: indent), range: enclosing)
-            }
+            marker(s, markerRange, prefix: true)
+            s.addAttribute(.typeQuoteBar, value: true, range: enclosing)
+            let indent = config.fontSize * 1.1
+            s.addAttribute(.paragraphStyle, value: paragraphStyle(headIndent: indent, firstLineIndent: indent), range: enclosing)
             contentStart = NSMaxRange(markerRange)
         }
         // Lists & tasks
@@ -351,30 +370,29 @@ final class MarkdownStyler {
                     let rest = NSRange(location: NSMaxRange(markerRange), length: NSMaxRange(line) - NSMaxRange(markerRange))
                     s.addAttributes([.foregroundColor: NSColor.secondaryLabelColor, .strikethroughStyle: NSUnderlineStyle.single.rawValue], range: rest)
                 }
-                if hide {
-                    // "- [ ] " → checkbox glyph: hide the bullet and brackets, draw the box over the middle char.
-                    let indentLen = m.range(at: 1).length
-                    hideRange(s, NSRange(location: line.location + indentLen, length: box.location - line.location - indentLen), prefix: true)
-                    hideRange(s, NSRange(location: box.location, length: 1), prefix: true)
-                    hideRange(s, NSRange(location: box.location + 2, length: 1), prefix: true)
-                    let mid = NSRange(location: box.location + 1, length: 1)
-                    let boxWidth = config.fontSize * 1.25
-                    let charWidth = (ns.substring(with: mid) as NSString).size(withAttributes: [.font: font()]).width
-                    s.addAttributes([.foregroundColor: NSColor.clear, .typeTaskBox: done, .kern: boxWidth - charWidth, .typeHiddenPrefix: true], range: mid)
-                    // The whitespace after "]" belongs to the prefix (caret never lands before it).
-                    let trailing = NSRange(location: box.location + 3, length: max(0, box.length - 3))
-                    s.addAttribute(.typeHiddenPrefix, value: true, range: trailing)
-                    let markerWidth = boxWidth + (ns.substring(with: trailing) as NSString).size(withAttributes: [.font: font()]).width
-                    indentList(s, indent: NSRange(location: line.location, length: m.range(at: 1).length), markerWidth: markerWidth, enclosing: enclosing)
-                    styleInline(s, ns: ns, range: NSRange(location: NSMaxRange(markerRange), length: NSMaxRange(line) - NSMaxRange(markerRange)))
-                    return
-                }
-            } else if hide, "-*+".contains(ns.substring(with: bullet)) {
+                // "- [ ] " → checkbox glyph: hide the bullet and brackets, draw the box over the middle char.
+                let indentLen = m.range(at: 1).length
+                hideRange(s, NSRange(location: line.location + indentLen, length: box.location - line.location - indentLen), prefix: true)
+                hideRange(s, NSRange(location: box.location, length: 1), prefix: true)
+                hideRange(s, NSRange(location: box.location + 2, length: 1), prefix: true)
+                let mid = NSRange(location: box.location + 1, length: 1)
+                let boxWidth = config.fontSize * 1.25
+                let charWidth = (ns.substring(with: mid) as NSString).size(withAttributes: [.font: font()]).width
+                s.addAttributes([.foregroundColor: NSColor.clear, .typeTaskBox: done, .kern: boxWidth - charWidth, .typeHiddenPrefix: true], range: mid)
+                // The whitespace after "]" belongs to the prefix (caret never lands before it).
+                let trailing = NSRange(location: box.location + 3, length: max(0, box.length - 3))
+                s.addAttribute(.typeHiddenPrefix, value: true, range: trailing)
+                let markerWidth = boxWidth + (ns.substring(with: trailing) as NSString).size(withAttributes: [.font: font()]).width
+                indentList(s, indent: NSRange(location: line.location, length: m.range(at: 1).length), markerWidth: markerWidth, enclosing: enclosing)
+                styleInline(s, ns: ns, range: NSRange(location: NSMaxRange(markerRange), length: NSMaxRange(line) - NSMaxRange(markerRange)))
+                return
+            } else if "-*+".contains(ns.substring(with: bullet)) {
                 s.addAttribute(.typeGlyph, value: "•", range: bullet)
                 visiblePrefix = visiblePrefix.replacingOccurrences(of: ns.substring(with: bullet), with: "•")
-                // Give "• " the same width as a checkbox so bullet and task text line up.
+                // Give "• " the width of "1. " so bulleted and numbered text start together, a word-gap
+                // from the bullet (the old checkbox-wide gap read as an extra space).
                 let natural = ((visiblePrefix as NSString).substring(from: m.range(at: 1).length) as NSString).size(withAttributes: [.font: font()]).width
-                let target = config.fontSize * 1.25 + (" " as NSString).size(withAttributes: [.font: font()]).width
+                let target = ("1. " as NSString).size(withAttributes: [.font: font()]).width
                 if target > natural { s.addAttribute(.kern, value: target - natural, range: bullet) }
             }
             let indentLength = m.range(at: 1).length
@@ -408,6 +426,14 @@ final class MarkdownStyler {
         let p = paragraphStyle(headIndent: base + leading + markerWidth, firstLineIndent: base).mutableCopy() as! NSMutableParagraphStyle
         p.tabStops = (1...12).map { NSTextTab(textAlignment: .natural, location: base + CGFloat($0) * level) }
         p.defaultTabInterval = level
+        // Items of one list sit close together, like Word and Notes; the gap comes after the list.
+        let next = NSMaxRange(enclosing)
+        if next < ns.length {
+            let nextLine = ns.lineRange(for: NSRange(location: next, length: 0))
+            if MDPattern.list.firstMatch(in: ns.substring(with: nextLine), range: NSRange(location: 0, length: nextLine.length)) != nil {
+                p.paragraphSpacing = (config.fontSize * 0.2).rounded()
+            }
+        }
         s.addAttribute(.paragraphStyle, value: p, range: enclosing)
     }
 
@@ -440,12 +466,19 @@ final class MarkdownStyler {
     /// Cell padding on each side of a table cell.
     var tableCellPadding: CGFloat { (config.fontSize * 0.6).rounded() }
 
-    private func tableFont(header: Bool) -> NSFont {
-        hide ? font(bold: header) : font(scale: 0.95, bold: header, mono: true)
+    /// Vertical padding above and below the text of each table row.
+    static func tableRowPadding(fontSize: CGFloat) -> CGFloat { (fontSize * 0.42).rounded() }
+
+    private static func width(of text: String, in font: NSFont) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font]).width
     }
 
-    /// A table row: an even grid when syntax is hidden (pipes become cell
-    /// borders, the `---` row a hairline), aligned columns when it's shown.
+    private func tableFont(header: Bool) -> NSFont {
+        font(bold: header)
+    }
+
+    /// A table row: an even grid (pipes become cell
+    /// borders, the `---` row a hairline).
     private func styleTableRow(_ s: NSTextStorage, ns: NSString, text: String, line: NSRange, enclosing: NSRange, table: NSRange) {
         let isHeader = line.location == table.location
         let isDivider = !isHeader && MDPattern.tableDivider.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil
@@ -453,7 +486,7 @@ final class MarkdownStyler {
         let p = NSMutableParagraphStyle()
         p.baseWritingDirection = config.direction.nsDirection
         p.lineBreakMode = .byClipping
-        if isDivider && hide {
+        if isDivider {
             p.minimumLineHeight = 1
             p.maximumLineHeight = 1
             s.addAttribute(.paragraphStyle, value: p, range: enclosing)
@@ -461,19 +494,21 @@ final class MarkdownStyler {
             s.addAttribute(.typeAtomic, value: AtomicKind.tableDivider.rawValue, range: line)
             return
         }
-        if hide {
-            let pad = (config.fontSize * 0.42).rounded()
-            p.paragraphSpacingBefore = pad
-            p.paragraphSpacing = pad
-            p.lineHeightMultiple = 1.05
-        } else {
-            p.lineHeightMultiple = max(1.0, config.lineHeight * 0.9)
-        }
+        let pad = Self.tableRowPadding(fontSize: config.fontSize)
+        p.paragraphSpacingBefore = pad
+        p.paragraphSpacing = pad
+        p.lineHeightMultiple = 1.05
         s.addAttribute(.paragraphStyle, value: p, range: enclosing)
+        let pipeFont = tableFont(header: false)
+        // A hidden pipe is drawn as a space with the pipe's advance: the grid
+        // owns the borders, and no temporary colour (focus dimming, typing
+        // fades) can bring the glyph back.
+        let pipeKern = Self.width(of: "|", in: pipeFont) - Self.width(of: " ", in: pipeFont)
         for i in Self.pipes(in: text) {
             // Same pipe width in every row (a bold header pipe is wider), so borders line up.
-            s.addAttributes([.foregroundColor: hide ? NSColor.clear : syntaxColor, .font: tableFont(header: false)],
-                            range: NSRange(location: line.location + i, length: 1))
+            var attributes: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.clear, .font: pipeFont]
+            attributes[.typeGlyph] = " "; attributes[.kern] = pipeKern
+            s.addAttributes(attributes, range: NSRange(location: line.location + i, length: 1))
         }
         if isDivider {
             s.addAttribute(.foregroundColor, value: syntaxColor, range: line)
@@ -485,15 +520,11 @@ final class MarkdownStyler {
     /// Offsets of the cell-border pipes in a table row (escaped `\|` and pipes in code are skipped).
     static func pipes(in row: String) -> [Int] {
         let ns = row as NSString
-        var code: [NSRange] = MDPattern.codeSpan.matches(in: row, range: NSRange(location: 0, length: ns.length)).map(\.range)
-        code = code.filter { $0.length > 0 }
-        var result: [Int] = []
-        for i in 0..<ns.length where ns.character(at: i) == 124 {
-            if i > 0 && ns.character(at: i - 1) == 92 { continue }
-            if code.contains(where: { NSLocationInRange(i, $0) }) { continue }
-            result.append(i)
+        let (escapes, code) = MarkdownEscapes.scan(ns)
+        let escaped = Set(escapes.map { $0 + 1 })
+        return (0..<ns.length).filter { i in
+            ns.character(at: i) == 124 && !escaped.contains(i) && !code.contains { NSLocationInRange(i, $0) }
         }
-        return result
     }
 
     /// Pads every cell with kerning so the columns line up.
@@ -527,13 +558,13 @@ final class MarkdownStyler {
         let columns = rows.map { $0.cells.count }.max() ?? 0
         guard columns > 0 else { return }
         var widths = [CGFloat](repeating: (config.fontSize * 3).rounded(), count: columns)
-        for row in rows where !(row.divider && hide) {
-            for (c, cell) in row.cells.enumerated() where !row.divider || !hide {
+        for row in rows where !row.divider {
+            for (c, cell) in row.cells.enumerated() {
                 widths[c] = max(widths[c], visibleWidth(s, cell.content).rounded(.up))
             }
         }
         let pad = tableCellPadding
-        for row in rows where !(row.divider && hide) {
+        for row in rows where !row.divider {
             for (c, cell) in row.cells.enumerated() where cell.closed {
                 // Space after the left border, then fill the cell out to its column width.
                 addKern(s, at: cell.pipe, pad - visibleWidth(s, cell.lead))
@@ -578,75 +609,103 @@ final class MarkdownStyler {
 
     private func styleInline(_ s: NSTextStorage, ns: NSString, range: NSRange) {
         guard range.length > 0 else { return }
-        let str = ns as String
+        let source = ns.substring(with: range)
+        // Escaped characters are hidden behind placeholders so no pattern can use them as syntax.
+        let str = MarkdownEscapes.masked(source)
+        let base = range.location
+        let all = NSRange(location: 0, length: (str as NSString).length)
+        func at(_ r: NSRange) -> NSRange { NSRange(location: r.location + base, length: r.length) }
+        for e in MarkdownEscapes.scan(source as NSString).escapes {
+            let r = NSRange(location: base + e, length: 1)
+            hideRange(s, r)
+            s.addAttribute(.typeEscape, value: true, range: r)
+        }
         var codeSpans: [NSRange] = []
 
-        for m in MDPattern.codeSpan.matches(in: str, range: range) {
-            codeSpans.append(m.range)
-            s.addAttributes([.font: font(mono: true), .backgroundColor: codeBackground, .typeCode: true], range: m.range)
+        for m in MDPattern.codeSpan.matches(in: str, range: all) {
+            let r = at(m.range)
+            codeSpans.append(r)
+            s.addAttributes([.font: font(mono: true), .backgroundColor: codeBackground, .typeCode: true], range: r)
             let tick = m.range(at: 1).length
-            marker(s, NSRange(location: m.range.location, length: tick))
-            marker(s, NSRange(location: NSMaxRange(m.range) - tick, length: tick))
+            marker(s, NSRange(location: r.location, length: tick))
+            marker(s, NSRange(location: NSMaxRange(r) - tick, length: tick))
         }
         func outsideCode(_ r: NSRange) -> Bool { !codeSpans.contains { NSIntersectionRange($0, r).length > 0 } }
 
-        for m in MDPattern.boldItalic.matches(in: str, range: range) where outsideCode(m.range) {
-            addTraits(s, m.range, bold: true, italic: true)
-            marker(s, NSRange(location: m.range.location, length: 3))
-            marker(s, NSRange(location: NSMaxRange(m.range) - 3, length: 3))
+        for m in MDPattern.boldItalic.matches(in: str, range: all) where outsideCode(at(m.range)) {
+            let r = at(m.range)
+            addTraits(s, r, bold: true, italic: true)
+            marker(s, NSRange(location: r.location, length: 3))
+            marker(s, NSRange(location: NSMaxRange(r) - 3, length: 3))
         }
         for regex in [MDPattern.boldStar, MDPattern.boldUnderscore] {
-            for m in regex.matches(in: str, range: range) where outsideCode(m.range) {
-                addTraits(s, m.range, bold: true)
-                marker(s, NSRange(location: m.range.location, length: 2))
-                marker(s, NSRange(location: NSMaxRange(m.range) - 2, length: 2))
+            for m in regex.matches(in: str, range: all) where outsideCode(at(m.range)) {
+                let r = at(m.range)
+                addTraits(s, r, bold: true)
+                marker(s, NSRange(location: r.location, length: 2))
+                marker(s, NSRange(location: NSMaxRange(r) - 2, length: 2))
             }
         }
         for regex in [MDPattern.italicStar, MDPattern.italicUnderscore] {
-            for m in regex.matches(in: str, range: range) where outsideCode(m.range) {
-                addTraits(s, m.range, italic: true)
-                marker(s, NSRange(location: m.range.location, length: 1))
-                marker(s, NSRange(location: NSMaxRange(m.range) - 1, length: 1))
+            for m in regex.matches(in: str, range: all) where outsideCode(at(m.range)) {
+                let r = at(m.range)
+                addTraits(s, r, italic: true)
+                marker(s, NSRange(location: r.location, length: 1))
+                marker(s, NSRange(location: NSMaxRange(r) - 1, length: 1))
             }
         }
-        for m in MDPattern.strike.matches(in: str, range: range) where outsideCode(m.range) {
-            s.addAttributes([.strikethroughStyle: NSUnderlineStyle.single.rawValue, .foregroundColor: NSColor.secondaryLabelColor], range: m.range)
-            marker(s, NSRange(location: m.range.location, length: 2))
-            marker(s, NSRange(location: NSMaxRange(m.range) - 2, length: 2))
+        for m in MDPattern.strike.matches(in: str, range: all) where outsideCode(at(m.range)) {
+            let r = at(m.range)
+            s.addAttributes([.strikethroughStyle: NSUnderlineStyle.single.rawValue, .foregroundColor: NSColor.secondaryLabelColor], range: r)
+            marker(s, NSRange(location: r.location, length: 2))
+            marker(s, NSRange(location: NSMaxRange(r) - 2, length: 2))
         }
-        for m in MDPattern.highlight.matches(in: str, range: range) where outsideCode(m.range) {
-            s.addAttribute(.backgroundColor, value: NSColor.systemYellow.dynamicAlpha(0.35), range: m.range)
-            marker(s, NSRange(location: m.range.location, length: 2))
-            marker(s, NSRange(location: NSMaxRange(m.range) - 2, length: 2))
+        for m in MDPattern.highlight.matches(in: str, range: all) where outsideCode(at(m.range)) {
+            let r = at(m.range)
+            s.addAttribute(.backgroundColor, value: NSColor.systemYellow.dynamicAlpha(0.35), range: r)
+            marker(s, NSRange(location: r.location, length: 2))
+            marker(s, NSRange(location: NSMaxRange(r) - 2, length: 2))
         }
         var linkRanges: [NSRange] = []
-        for m in MDPattern.link.matches(in: str, range: range) where outsideCode(m.range) {
-            linkRanges.append(m.range)
+        for m in MDPattern.link.matches(in: str, range: all) where outsideCode(at(m.range)) {
+            let whole = at(m.range)
+            linkRanges.append(whole)
             let isImage = m.range(at: 1).length > 0
-            let label = m.range(at: 2)
-            dim(s, m.range)
+            let label = at(m.range(at: 2))
+            dim(s, whole)
             s.addAttribute(.foregroundColor, value: isImage ? NSColor.secondaryLabelColor : accentColor, range: label)
             if !isImage {
                 s.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: label)
                 s.addAttribute(.underlineColor, value: accentColor.dynamicAlpha(0.35), range: label)
             }
-            if hide {
-                hideRange(s, NSRange(location: m.range.location, length: label.location - m.range.location))
-                hideRange(s, NSRange(location: NSMaxRange(label), length: NSMaxRange(m.range) - NSMaxRange(label)))
+            let urlRange = at(m.range(at: 3))
+            let url = MarkdownEscapes.unescaped(ns.substring(with: urlRange))
+            let scheme = LinkDisplay.schemeLength(url)
+            if label.length == 0, !isImage, scheme < urlRange.length {
+                // No label: the address (without its scheme) stands in for it.
+                let shown = NSRange(location: urlRange.location + scheme, length: urlRange.length - scheme)
+                hideRange(s, NSRange(location: whole.location, length: shown.location - whole.location))
+                hideRange(s, NSRange(location: NSMaxRange(shown), length: NSMaxRange(whole) - NSMaxRange(shown)))
+                s.addAttributes([.foregroundColor: accentColor, .underlineStyle: NSUnderlineStyle.single.rawValue,
+                                 .underlineColor: accentColor.dynamicAlpha(0.35)], range: shown)
+                s.addAttribute(.typeLink, value: url, range: whole)
+                s.addAttribute(.toolTip, value: url, range: shown)
+                continue
             }
-            let url = ns.substring(with: m.range(at: 3))
-            s.addAttribute(.typeLink, value: url, range: m.range)
+            hideRange(s, NSRange(location: whole.location, length: label.location - whole.location))
+            hideRange(s, NSRange(location: NSMaxRange(label), length: NSMaxRange(whole) - NSMaxRange(label)))
+            s.addAttribute(.typeLink, value: url, range: whole)
             s.addAttribute(.toolTip, value: url, range: label)
         }
-        for m in MDPattern.bareURL.matches(in: str, range: range) where outsideCode(m.range) && !linkRanges.contains(where: { NSIntersectionRange($0, m.range).length > 0 }) {
-            s.addAttributes([.foregroundColor: accentColor, .typeLink: ns.substring(with: m.range)], range: m.range)
+        for m in MDPattern.bareURL.matches(in: str, range: all) where outsideCode(at(m.range)) && !linkRanges.contains(where: { NSIntersectionRange($0, at(m.range)).length > 0 }) {
+            s.addAttributes([.foregroundColor: accentColor, .typeLink: MarkdownEscapes.unescaped(ns.substring(with: at(m.range)))], range: at(m.range))
         }
     }
 
-    /// A syntax marker: dimmed, or hidden when `hideSyntax` is on.
+    /// A syntax marker: dimmed and hidden.
     private func marker(_ s: NSTextStorage, _ r: NSRange, prefix: Bool = false) {
         dim(s, r)
-        if hide { hideRange(s, r, prefix: prefix) }
+        hideRange(s, r, prefix: prefix)
     }
 
     private func hideRange(_ s: NSTextStorage, _ r: NSRange, prefix: Bool = false) {

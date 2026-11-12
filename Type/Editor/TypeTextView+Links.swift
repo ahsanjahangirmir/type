@@ -5,7 +5,10 @@ extension TypeTextView {
     struct LinkTarget {
         /// The existing `[label](url)`, or the text that will become the label.
         var range: NSRange
+        /// What the popover shows: the label with its escapes resolved.
         var label: String
+        /// The label as stored (with escapes), for turning the link back into text.
+        var rawLabel: String
         var url: String
         var isExisting: Bool
     }
@@ -17,10 +20,12 @@ extension TypeTextView {
         let sel = selectedRange()
         let line = contentLineRange(at: sel.location)
         let text = ns.substring(with: line) as NSString
-        for m in MDPattern.link.matches(in: text as String, range: NSRange(location: 0, length: text.length)) where m.range(at: 1).length == 0 {
+        let masked = MarkdownEscapes.masked(text as String)
+        for m in MDPattern.link.matches(in: masked, range: NSRange(location: 0, length: text.length)) where m.range(at: 1).length == 0 {
             let r = NSRange(location: line.location + m.range.location, length: m.range.length)
             if sel.location >= r.location, sel.location <= NSMaxRange(r) {
-                return LinkTarget(range: r, label: text.substring(with: m.range(at: 2)), url: text.substring(with: m.range(at: 3)), isExisting: true)
+                let raw = text.substring(with: m.range(at: 2))
+                return LinkTarget(range: r, label: MarkdownEscapes.unescaped(raw), rawLabel: raw, url: text.substring(with: m.range(at: 3)), isExisting: true)
             }
         }
         let contentStart = line.location + InlineFormatter.contentStart(of: text as String)
@@ -31,16 +36,17 @@ extension TypeTextView {
         }
         while r.length > 0, ns.character(at: r.location) == 32 { r.location += 1; r.length -= 1 }
         while r.length > 0, ns.character(at: NSMaxRange(r) - 1) == 32 { r.length -= 1 }
-        return LinkTarget(range: r, label: ns.substring(with: r), url: "", isExisting: false)
+        let raw = ns.substring(with: r)
+        return LinkTarget(range: r, label: MarkdownEscapes.unescaped(raw), rawLabel: raw, url: "", isExisting: false)
     }
 
     /// Writes `[label](url)` over the target and puts the caret after it.
     func applyLink(_ target: LinkTarget, label: String, url: String) {
         let link = Self.normalizedURL(url)
         guard !link.isEmpty else { return }
-        var text = label.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "")
-            .replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-        if text.isEmpty { text = url.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // The label is literal text: `a*b` and `x]y` are stored escaped.
+        let typed = label.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        let text = typed.isEmpty ? "" : MarkdownEscapes.escape(typed, linePrefix: "a")
         let markdown = "[\(text)](\(link))"
         replace(target.range, with: markdown, caret: target.range.location + (markdown as NSString).length)
     }
@@ -48,8 +54,8 @@ extension TypeTextView {
     /// Turns a link back into plain text, keeping the label selected.
     func removeLink(_ target: LinkTarget) {
         guard target.isExisting else { return }
-        replace(target.range, with: target.label, caret: nil,
-                select: NSRange(location: target.range.location, length: (target.label as NSString).length))
+        replace(target.range, with: target.rawLabel, caret: nil,
+                select: NSRange(location: target.range.location, length: (target.rawLabel as NSString).length))
     }
 
     /// Adds `https://` (or `mailto:`) when missing and escapes what Markdown can't hold in a URL.

@@ -16,6 +16,9 @@ final class LibraryWindowState: ObservableObject {
     /// Whether the sidebar shows (toggled with the toolbar button or View ▸ Hide Sidebar).
     @Published var columns: NavigationSplitViewVisibility = .all
 
+    /// This window's editor, so renaming the open page can edit its text as an undoable change.
+    weak var editor: EditorController?
+
     private var library: LibraryStore { .shared }
 
     func newNotebook() {
@@ -49,7 +52,12 @@ final class LibraryWindowState: ObservableObject {
             } else {
                 // A page's name is its first heading; the file follows it.
                 let model = library.page(for: url)
-                model.setHeading(name)
+                guard let edit = model.headingEdit(for: name) else { return }
+                if model === self.model, let tv = editor?.textView, tv.replaceUndoably(edit.range, with: edit.replacement) {
+                    // The open page: edited through its text view, so ⌘Z undoes the rename.
+                } else {
+                    model.setHeading(name)
+                }
                 model.saveNow()
                 syncFileName(url)
             }
@@ -120,6 +128,7 @@ struct LibraryWindow: View {
         .navigationSubtitle(state.model != nil ? (state.notebook?.lastPathComponent ?? "") : "")
         .focusedSceneObject(state)
         .focusedSceneObject(controller)
+        .focusedSceneValue(\.showOutline, $showOutline)
         .preferredColorScheme(settings.appearance.colorScheme)
         .onAppear(perform: restoreSelection)
         .onChange(of: state.columns) { _, columns in storedSidebarHidden = columns == .detailOnly }
@@ -133,6 +142,8 @@ struct LibraryWindow: View {
             if let old {
                 library.page(for: old).saveNow()
                 state.syncFileName(old)
+                // The list keeps its order while you type; re-sort it now that you've moved on.
+                library.refresh()
             }
             storedPage = state.page?.path ?? ""
         }
@@ -168,6 +179,7 @@ struct LibraryWindow: View {
     }
 
     private func restoreSelection() {
+        state.editor = controller
         if storedSidebarHidden { state.columns = .detailOnly }
         if !storedNotebook.isEmpty, library.notebooks.contains(where: { $0.url.path == storedNotebook }) {
             state.notebook = URL(fileURLWithPath: storedNotebook, isDirectory: true).standardizedFileURL
@@ -191,7 +203,39 @@ private struct LibraryPageEditor: View {
         EditorPane(text: $page.text, controller: controller, fileURL: page.url,
                    undoManager: page.undoManager, documentID: ObjectIdentifier(page),
                    inLibrary: true, showOutline: $showOutline)
+            .overlay(alignment: .top) {
+                if let conflict = page.conflict {
+                    ConflictBanner(copy: conflict.copy) { page.dismissConflict() }
+                        .padding(.top, 60)
+                        .transition(.opacity)
+                }
+            }
             .onDisappear { page.saveNow() }
+    }
+}
+
+/// Shown when another app changed the page's file while it had unsaved edits.
+private struct ConflictBanner: View {
+    let copy: URL
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+            Text("Another app changed this page. Your version was kept; the other is saved as “\(copy.deletingPathExtension().lastPathComponent)”.")
+                .font(.callout)
+                .lineLimit(2)
+            Button("Show") { NSWorkspace.shared.activateFileViewerSelecting([copy]) }
+                .buttonStyle(.glass)
+            Button { dismiss() } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .glassEffect(.regular, in: .rect(cornerRadius: 16))
+        .frame(maxWidth: 640)
+        .padding(.horizontal, 24)
     }
 }
 

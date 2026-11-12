@@ -146,7 +146,7 @@ enum MarkdownHTML {
 
     private static func table(_ rows: [String]) -> String {
         func cells(_ row: String) -> [String] {
-            var r = row.trimmingCharacters(in: .whitespaces)
+            var r = MarkdownEscapes.protect(row).trimmingCharacters(in: .whitespaces)
             if r.hasPrefix("|") { r.removeFirst() }
             if r.hasSuffix("|") { r.removeLast() }
             return r.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -172,7 +172,8 @@ enum MarkdownHTML {
 
     private static let codeSpan = try! NSRegularExpression(pattern: #"(`+)(.+?)\1"#)
 
-    static func inline(_ text: String) -> String {
+    static func inline(_ source: String) -> String {
+        let text = MarkdownEscapes.protect(source)
         // Protect code spans first.
         var placeholders: [String] = []
         let ns = text as NSString
@@ -186,7 +187,7 @@ enum MarkdownHTML {
         }
         protected += ns.substring(from: last)
 
-        var s = images(in: escape(protected), placeholders: &placeholders)
+        var s = emptyLinks(in: images(in: escape(protected), placeholders: &placeholders), placeholders: &placeholders)
         let rules: [(String, String)] = [
             (#"\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)"#, "<a href=\"$2\">$1</a>"),
             (#"(?<![\"=>])\b(https?://[^\s<]+[^\s<.,;:!?)])"#, "<a href=\"$1\">$1</a>"),
@@ -204,7 +205,28 @@ enum MarkdownHTML {
         for (n, p) in placeholders.enumerated() {
             s = s.replacingOccurrences(of: "\u{E000}\(n)\u{E001}", with: p)
         }
-        return s
+        // Escaped characters come back literal (and HTML-escaped).
+        return s.unicodeScalars.reduce(into: "") { out, u in
+            if (0xE121...0xE17E).contains(u.value), let c = UnicodeScalar(u.value - 0xE100) { out += escape(String(c)) } else { out.unicodeScalars.append(u) }
+        }
+    }
+
+    private static let emptyLinkRegex = try! NSRegularExpression(pattern: #"(?<!!)\[\]\(([^)\s]+)(?:\s+&quot;.*?&quot;)?\)"#)
+
+    /// `[](url)` has no label to show, so the address (without its scheme) stands in.
+    private static func emptyLinks(in s: String, placeholders: inout [String]) -> String {
+        let ns = s as NSString
+        var out = ""
+        var last = 0
+        for m in emptyLinkRegex.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
+            out += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+            let url = ns.substring(with: m.range(at: 1))
+            let shown = LinkDisplay.text(for: url)
+            placeholders.append("<a href=\"\(url)\">\(shown.isEmpty ? url : shown)</a>")
+            out += "\u{E000}\(placeholders.count - 1)\u{E001}"
+            last = NSMaxRange(m.range)
+        }
+        return out + ns.substring(from: last)
     }
 
     private static let imageRegex = try! NSRegularExpression(pattern: #"!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;(.*?)&quot;)?\)"#)
@@ -245,6 +267,6 @@ enum MarkdownHTML {
     }
 
     private static func stripComments(_ s: String) -> String {
-        s.replacingOccurrences(of: #"<!--[\s\S]*?(?:-->|\z)"#, with: "", options: .regularExpression)
+        s.replacingOccurrences(of: #"(?<!\\)<!--[\s\S]*?(?:-->|\z)"#, with: "", options: .regularExpression)
     }
 }

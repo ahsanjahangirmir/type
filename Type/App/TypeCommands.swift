@@ -1,9 +1,20 @@
 import SwiftUI
 
+/// The focused window's outline-inspector state, so View ▸ Outline works
+/// even while the toolbar (and its toggle) is hidden.
+private struct ShowOutlineKey: FocusedValueKey { typealias Value = Binding<Bool> }
+extension FocusedValues {
+    var showOutline: Binding<Bool>? {
+        get { self[ShowOutlineKey.self] }
+        set { self[ShowOutlineKey.self] = newValue }
+    }
+}
+
 struct TypeCommands: Commands {
     @ObservedObject var settings: AppSettings
     @FocusedObject private var editor: EditorController?
     @FocusedObject private var library: LibraryWindowState?
+    @FocusedValue(\.showOutline) private var showOutline
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
@@ -59,7 +70,7 @@ struct TypeCommands: Commands {
                 Button("Italic") { editor?.italic() }.keyboardShortcut("i")
                 Button("Strikethrough") { editor?.strikethrough() }.keyboardShortcut("x", modifiers: [.command, .shift])
                 Button("Highlight") { editor?.highlight() }.keyboardShortcut("h", modifiers: [.command, .shift])
-                Button("Inline Code") { editor?.inlineCode() }.keyboardShortcut("e")
+                Button("Inline Code") { editor?.inlineCode() }.keyboardShortcut("e", modifiers: [.command, .shift])
                 Button("Link") { editor?.link() }.keyboardShortcut("k")
             }
             Divider()
@@ -90,13 +101,15 @@ struct TypeCommands: Commands {
 
         CommandGroup(before: .toolbar) {
             Toggle("Focus Mode", isOn: $settings.focusMode).keyboardShortcut("f", modifiers: [.command, .shift])
-            Toggle("Typewriter Scrolling", isOn: $settings.typewriterScrolling).keyboardShortcut("t", modifiers: [.command, .option])
+            Toggle("Typewriter Scrolling", isOn: $settings.typewriterScrolling).keyboardShortcut("t", modifiers: [.command, .control])
             Toggle("Typing Sounds", isOn: $settings.typingSounds).keyboardShortcut("s", modifiers: [.command, .option])
             Picker("Typing Sound", selection: $settings.soundProfile) {
                 ForEach(SoundProfile.allCases) { Text($0.label).tag($0) }
             }
-            Toggle("Hide Markdown Syntax", isOn: $settings.hideSyntax).keyboardShortcut("h", modifiers: [.command, .control])
-            Toggle("Show Statistics", isOn: $settings.showStats).keyboardShortcut("w", modifiers: [.command, .option])
+            Toggle("Show Statistics", isOn: $settings.showStats).keyboardShortcut("w", modifiers: [.command, .control])
+            Toggle("Show Outline", isOn: showOutline ?? .constant(false))
+                .keyboardShortcut("o", modifiers: [.command, .option])
+                .disabled(showOutline == nil)
             Toggle("Hide Toolbar While Typing", isOn: $settings.autoHideChrome)
             Divider()
             Button("Zoom In") { settings.zoomIn() }.keyboardShortcut("=")

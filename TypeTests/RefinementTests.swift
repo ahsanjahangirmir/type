@@ -141,8 +141,7 @@ final class ImageTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         try samplePNG(width: 400, height: 200).write(to: dir.appendingPathComponent("a.png"))
 
-        var config = AppSettings.shared.editorConfig
-        config.hideSyntax = false
+        let config = AppSettings.shared.editorConfig
         let styler = MarkdownStyler(config: config)
         styler.columnWidth = 300
         styler.imageProvider = { ImageStore.resolve($0, baseURL: dir).flatMap { NSImage(contentsOf: $0) } }
@@ -162,7 +161,6 @@ final class HiddenSyntaxTests: XCTestCase {
         tv.isRichText = false
         tv.allowsUndo = true
         var config = AppSettings.shared.editorConfig
-        config.hideSyntax = true
         config.smartQuotes = false
         tv.config = config
         tv.installLayoutDelegate()
@@ -191,16 +189,6 @@ final class HiddenSyntaxTests: XCTestCase {
         let task = makeView("- [x] done")
         XCTAssertEqual(task.textStorage?.attribute(.typeTaskBox, at: 3, effectiveRange: nil) as? Bool, true)
         XCTAssertEqual(hidden(task), "^^^.^.....")
-    }
-
-    func testVisibleWhenSettingOff() {
-        let tv = TypeTextView(usingTextLayoutManager: false)
-        let config = AppSettings.shared.editorConfig
-        var c = config; c.hideSyntax = false
-        tv.config = c
-        tv.string = "## Head **b**"
-        MarkdownStyler(config: c).style(tv.textStorage!, blocks: BlockRanges())
-        XCTAssertEqual(hidden(tv), String(repeating: ".", count: 13))
     }
 
     func testBackspaceSkipsHiddenMarkers() {
@@ -277,12 +265,11 @@ final class PageTitleTests: XCTestCase {
 
 @MainActor
 final class EditorFixTests: XCTestCase {
-    private func makeView(_ text: String, hide: Bool = true) -> TypeTextView {
+    private func makeView(_ text: String) -> TypeTextView {
         let tv = TypeTextView(usingTextLayoutManager: false)
         tv.isRichText = false
         tv.allowsUndo = true
         var config = AppSettings.shared.editorConfig
-        config.hideSyntax = hide
         config.smartQuotes = false
         tv.config = config
         tv.installLayoutDelegate()
@@ -297,7 +284,6 @@ final class EditorFixTests: XCTestCase {
         tv.toggleWrap("==")
         XCTAssertEqual(tv.string, "The ==quick brown== fox jumps")
         var config = AppSettings.shared.editorConfig
-        config.hideSyntax = true
         MarkdownStyler(config: config).style(tv.textStorage!, blocks: BlockRanges())
         XCTAssertNotNil(tv.textStorage?.attribute(.backgroundColor, at: 8, effectiveRange: nil), "highlighted")
         XCTAssertNotNil(tv.textStorage?.attribute(.typeHidden, at: 4, effectiveRange: nil), "markers hidden")
@@ -308,8 +294,8 @@ final class EditorFixTests: XCTestCase {
     }
 
     func testListsAreIndented() {
-        for hide in [true, false] {
-            let tv = makeView("Para\n- item\n    - nested\n1. first\n- [ ] task", hide: hide)
+        do {
+            let tv = makeView("Para\n- item\n    - nested\n1. first\n- [ ] task")
             let s = tv.textStorage!
             func style(_ i: Int) -> NSParagraphStyle { s.attribute(.paragraphStyle, at: i, effectiveRange: nil) as! NSParagraphStyle }
             let ns = tv.string as NSString

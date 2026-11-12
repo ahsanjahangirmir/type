@@ -38,10 +38,10 @@ final class SmartTypingTests: XCTestCase {
     func testHorizontalRuleAndCommentsAreNotMangled() {
         let tv = makeView()
         type("---", into: tv)
-        XCTAssertEqual(tv.string, "---")
+        XCTAssertEqual(tv.string, "\\---", "typed dashes stay literal text, never a rule")
         let tv2 = makeView()
         type("<!--", into: tv2)
-        XCTAssertEqual(tv2.string, "<!--")
+        XCTAssertEqual(tv2.string, "\\<!--", "typed `<!--` is literal, not a comment")
     }
 
     func testSmartTypingDisabled() {
@@ -58,13 +58,17 @@ final class SmartTypingTests: XCTestCase {
 
     func testBulletListContinuesAndEnds() {
         let tv = makeView()
-        type("- one\ntwo\n\n", into: tv)
+        tv.string = "- one"
+        tv.setSelectedRange(NSRange(location: 5, length: 0))
+        type("\ntwo\n\n", into: tv)
         XCTAssertEqual(tv.string, "- one\n- two\n")
     }
 
     func testChecklistContinues() {
         let tv = makeView()
-        type("- [x] done\nnext", into: tv)
+        tv.string = "- [x] done"
+        tv.setSelectedRange(NSRange(location: 10, length: 0))
+        type("\nnext", into: tv)
         XCTAssertEqual(tv.string, "- [x] done\n- [ ] next")
     }
 
