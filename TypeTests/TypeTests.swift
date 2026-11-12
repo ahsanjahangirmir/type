@@ -206,18 +206,18 @@ final class ExportTests: XCTestCase {
         FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
     }
 
-    func testAllFormatsWrite() throws {
+    func testAllFormatsWrite() async throws {
         for format in ExportFormat.allCases {
             let url = tempURL(format.fileExtension)
-            try Exporter.write(markdown: md, title: "Test", baseURL: nil, format: format, fontChoice: .serif, customFamily: "", to: url)
+            try await Exporter.write(markdown: md, title: "Test", baseURL: nil, format: format, fontChoice: .serif, customFamily: "", to: url)
             let size = try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int ?? 0
             XCTAssertGreaterThan(size, 20, "\(format) export is empty")
         }
     }
 
-    func testWordRoundTrip() throws {
+    func testWordRoundTrip() async throws {
         let url = tempURL("docx")
-        try Exporter.write(markdown: md, title: "Test", baseURL: nil, format: .word, fontChoice: .serif, customFamily: "", to: url)
+        try await Exporter.write(markdown: md, title: "Test", baseURL: nil, format: .word, fontChoice: .serif, customFamily: "", to: url)
         let back = try RichTextImporter.markdown(from: Data(contentsOf: url), type: .officeOpenXML)
         XCTAssertTrue(back.contains("# Heading"), back)
         XCTAssertTrue(back.contains("**bold**"), back)
@@ -225,9 +225,9 @@ final class ExportTests: XCTestCase {
         XCTAssertTrue(back.contains("- item one"), back)
     }
 
-    func testRTFRoundTrip() throws {
+    func testRTFRoundTrip() async throws {
         let url = tempURL("rtf")
-        try Exporter.write(markdown: md, title: "Test", baseURL: nil, format: .rtf, fontChoice: .sans, customFamily: "", to: url)
+        try await Exporter.write(markdown: md, title: "Test", baseURL: nil, format: .rtf, fontChoice: .sans, customFamily: "", to: url)
         let back = try RichTextImporter.markdown(from: Data(contentsOf: url), type: .rtf)
         XCTAssertTrue(back.contains("**bold**"), back)
         XCTAssertTrue(back.contains("item two"), back)
