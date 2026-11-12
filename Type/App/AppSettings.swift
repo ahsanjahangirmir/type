@@ -216,6 +216,7 @@ struct EditorConfig: Equatable {
     var commentTint: CommentTint
     var dimSyntax: Bool
     var hideSyntax: Bool
+    var smoothTyping: Bool
 }
 
 // MARK: - Settings store
@@ -245,6 +246,7 @@ final class AppSettings: ObservableObject {
     @Published var selectionCustomHex = "#FF9F0A59" { didSet { save(selectionCustomHex, "selectionCustomHex") } }
     @Published var dimSyntax = true { didSet { save(dimSyntax, "dimSyntax") } }
     @Published var hideSyntax = false { didSet { save(hideSyntax, "hideSyntax") } }
+    @Published var smoothTyping = true { didSet { save(smoothTyping, "smoothTyping") } }
     @Published var commentTint: CommentTint = .green { didSet { save(commentTint.rawValue, "commentTint") } }
 
     // Writing
@@ -305,8 +307,13 @@ final class AppSettings: ObservableObject {
         if let hex = store.string(forKey: "selectionCustomHex"), NSColor(hex: hex) != nil { selectionCustomHex = hex }
         load("dimSyntax", &dimSyntax)
         load("hideSyntax", &hideSyntax)
+        load("smoothTyping", &smoothTyping)
         load("soundProfile", &soundProfile)
         if let path = store.string(forKey: "libraryPath"), !path.isEmpty { libraryPath = (path as NSString).expandingTildeInPath }
+        if Self.isTestHost {
+            // Unit tests run inside the app: never open (or rename files in) the real library.
+            libraryPath = FileManager.default.temporaryDirectory.appendingPathComponent("TypeTestHostLibrary").path
+        }
         load("pageSort", &pageSort)
         load("commentTint", &commentTint)
         load("focusMode", &focusMode)
@@ -333,8 +340,12 @@ final class AppSettings: ObservableObject {
     /// run only; they must never overwrite the user's saved preferences.
     private static let launchOverrides = Set(UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain).keys)
 
+    /// True when the app is hosting the unit tests.
+    static let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        || NSClassFromString("XCTestCase") != nil
+
     private func save(_ value: Any, _ key: String) {
-        guard !Self.launchOverrides.contains(key) else { return }
+        guard !Self.launchOverrides.contains(key), !Self.isTestHost else { return }
         store.set(value, forKey: key)
     }
 
@@ -363,7 +374,8 @@ final class AppSettings: ObservableObject {
             typingSounds: typingSounds,
             commentTint: commentTint,
             dimSyntax: dimSyntax,
-            hideSyntax: hideSyntax
+            hideSyntax: hideSyntax,
+            smoothTyping: smoothTyping
         )
     }
 

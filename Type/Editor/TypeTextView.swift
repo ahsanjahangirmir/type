@@ -29,25 +29,87 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     private var imageViews: [ImageBlockView] = []
     private var imageLayoutScheduled = false
 
+    /// The caret (drawn by us so it keeps one height and can glide).
+    let caretOverlay = CaretOverlay(frame: .zero)
+    private var caretUpdateScheduled = false
+    private var caretAnimates = false
+    private var windowObservers: [NSObjectProtocol] = []
+    /// Just-typed characters that are still fading in.
+    private var fades: [(range: NSRange, start: CFTimeInterval)] = []
+    private var fadeLink: CADisplayLink?
+    static let fadeDuration: CFTimeInterval = 0.13
+    /// Formats to turn on (true) or off (false) for the next typed character;
+    /// set by ⌘B, ⌘I… when nothing is selected, like a word processor.
+    private(set) var pendingFormats: [InlineFormat: Bool] = [:]
+    private var pendingFormatLocation = -1
+
+    var smoothTyping: Bool {
+        config?.smoothTyping == true && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
     // MARK: Setup
 
     func applyChrome() {
         guard let config else { return }
-        insertionPointColor = config.hideCaret ? .clear : config.caretColor.nsColor
+        // The system caret stays invisible; `caretOverlay` draws ours.
+        insertionPointColor = .clear
+        caretOverlay.color = config.caretColor.nsColor
         selectedTextAttributes = [.backgroundColor: config.selectionColor.nsColor(custom: config.selectionCustomHex)]
         baseWritingDirection = config.direction.nsDirection
         refreshFocusDimming(force: true)
         needsDisplay = true
+        scheduleCaretUpdate(animated: false)
     }
 
     func installLayoutDelegate() {
         layoutManager?.delegate = self
+        installCaretOverlay()
+        // Inline predictions show grey suggested text inside the word being
+        // typed, which fights the live Markdown styling (headings, emphasis).
+        inlinePredictionType = .no
+    }
+
+    private func installCaretOverlay() {
+        if caretOverlay.superview !== self { addSubview(caretOverlay) }
+        caretOverlay.frame = bounds
     }
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        caretOverlay.frame = bounds
         updateLayoutInsets()
         scheduleImageLayout()
+        scheduleCaretUpdate(animated: false)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
+        windowObservers = []
+        guard let window else { return }
+        installCaretOverlay()
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            windowObservers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.scheduleCaretUpdate(animated: false) }
+            })
+        }
+        scheduleCaretUpdate(animated: false)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        scheduleCaretUpdate(animated: false)
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        scheduleCaretUpdate(animated: false)
+        return ok
+    }
+
+    override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
+        // Drawn by `caretOverlay`.
     }
 
     /// Centers the text column and, in typewriter mode, pads top/bottom so the
@@ -119,6 +181,10 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     override func doCommand(by selector: Selector) {
         if events?.textView(self, handleSlashCommand: selector) == true { return }
+        if selector == #selector(insertNewline(_:)), newlineAfterSelectedAtomicLine() { return }
+        if selector == #selector(insertNewline(_:)), insertTableRowOnNewline() { return }
+        if selector == #selector(insertTab(_:)), moveToTableCell(forward: true) { return }
+        if selector == #selector(insertBacktab(_:)), moveToTableCell(forward: false) { return }
         if selector == #selector(insertNewline(_:)), config?.continueLists == true, continueListOnNewline() { return }
         if selector == #selector(insertTab(_:)), indentListItem(outdent: false) { return }
         if selector == #selector(insertBacktab(_:)), indentListItem(outdent: true) { return }
@@ -127,10 +193,21 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     override func insertText(_ string: Any, replacementRange: NSRange) {
         let typed = (string as? String) ?? (string as? NSAttributedString)?.string ?? ""
-        guard let config, typed.count == 1, !hasMarkedText() else {
+        guard config != nil, typed.count == 1, !hasMarkedText() else {
             super.insertText(string, replacementRange: replacementRange)
             return
         }
+        let fromKeyboard = NSApp.currentEvent?.type == .keyDown
+        let plain = replacementRange.location == NSNotFound || replacementRange == selectedRange()
+        if !(plain && (typeBesideAtomicLine(typed) || insertWithPendingFormats(typed))) {
+            insertSmart(string, typed: typed, replacementRange: replacementRange)
+        }
+        if fromKeyboard { fadeInCharacterBeforeCaret() }
+    }
+
+    /// Smart quotes, dashes, arrows, ellipses and auto-capitalization.
+    private func insertSmart(_ string: Any, typed: String, replacementRange: NSRange) {
+        guard let config else { return }
         let ns = self.string as NSString
         let sel = replacementRange.location != NSNotFound ? replacementRange : selectedRange()
         let loc = sel.location
@@ -292,44 +369,161 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         if let select { setSelectedRange(select) } else if let caret { setSelectedRange(NSRange(location: caret, length: 0)) }
     }
 
-    /// Toggles an inline wrapper like `**` around the selection.
-    func toggleWrap(_ marker: String, placeholder: String = "") {
+    /// Toggles an inline format on the selection (each line and table cell
+    /// separately, never over a line prefix). With no selection it applies to
+    /// the word around the caret, or to the next typed text between words.
+    func toggleFormat(_ format: InlineFormat) {
         let ns = string as NSString
         var sel = selectedRange()
-        let m = (marker as NSString).length
-        // Expand an empty selection to the word under the caret.
-        if sel.length == 0, placeholder.isEmpty {
+        if sel.length == 0 {
             let word = wordRange(at: sel.location)
-            if word.length > 0 { sel = word }
+            if word.length > 0, sel.location > word.location, sel.location < NSMaxRange(word) {
+                sel = word
+            } else {
+                togglePendingFormat(format, at: sel.location)
+                return
+            }
         }
-        // Markers must hug the text ("==a b==", not "== a b =="), so leave
-        // surrounding whitespace (often caught by a drag selection) outside them.
-        while sel.length > 0, let u = UnicodeScalar(ns.character(at: sel.location)), CharacterSet.whitespacesAndNewlines.contains(u) {
-            sel = NSRange(location: sel.location + 1, length: sel.length - 1)
+        let block = ns.lineRange(for: sel)
+        var lines: [(range: NSRange, text: String, segments: [NSRange])] = []
+        var loc = block.location
+        while loc < NSMaxRange(block) {
+            let line = contentLineRange(at: loc)
+            loc = NSMaxRange(ns.lineRange(for: NSRange(location: loc, length: 0)))
+            let local = NSIntersectionRange(sel, line)
+            guard local.length > 0, isFormattableLine(line) else { continue }
+            let text = ns.substring(with: line)
+            let segments = InlineFormatter.segments(of: text, selection: NSRange(location: local.location - line.location, length: local.length))
+            if !segments.isEmpty { lines.append((line, text, segments)) }
         }
-        while sel.length > 0, let u = UnicodeScalar(ns.character(at: NSMaxRange(sel) - 1)), CharacterSet.whitespacesAndNewlines.contains(u) {
-            sel.length -= 1
+        guard !lines.isEmpty else { NSSound.beep(); return }
+        let turnOn = !lines.allSatisfy { l in l.segments.allSatisfy { InlineFormatter.isActive(format, in: l.text, segment: $0) } }
+
+        // Rebuild each affected line, last segment first so earlier offsets hold.
+        var newLines: [(range: NSRange, text: String, selection: NSRange?)] = []
+        for l in lines {
+            var text = l.text
+            var selections: [NSRange] = []
+            for seg in l.segments.reversed() {
+                if turnOn == InlineFormatter.isActive(format, in: text, segment: seg) { continue }
+                guard let edit = InlineFormatter.edit(format, on: turnOn, in: text, segment: seg) else { continue }
+                text = (text as NSString).replacingCharacters(in: edit.range, with: edit.text)
+                let delta = (edit.text as NSString).length - edit.range.length
+                selections = selections.map { NSRange(location: $0.location + delta, length: $0.length) }
+                selections.append(edit.selection)
+            }
+            let union = selections.reduce(NSRange?.none) { acc, r in acc.map { NSUnionRange($0, r) } ?? r }
+            newLines.append((l.range, text, union))
         }
-        // Already wrapped? Unwrap.
-        if sel.location >= m, NSMaxRange(sel) + m <= ns.length,
-           ns.substring(with: NSRange(location: sel.location - m, length: m)) == marker,
-           ns.substring(with: NSRange(location: NSMaxRange(sel), length: m)) == marker {
-            let inner = ns.substring(with: sel)
-            replace(NSRange(location: sel.location - m, length: sel.length + 2 * m), with: inner, caret: nil,
-                    select: NSRange(location: sel.location - m, length: sel.length))
-            return
+        guard newLines.contains(where: { $0.text != ns.substring(with: $0.range) }) else { NSSound.beep(); return }
+        let span = NSRange(location: newLines.first!.range.location, length: NSMaxRange(newLines.last!.range) - newLines.first!.range.location)
+        var result = ns.substring(with: span) as NSString
+        var newSelection: NSRange?
+        var offsetShift = 0
+        for l in newLines {
+            let local = NSRange(location: l.range.location - span.location + offsetShift, length: l.range.length)
+            result = result.replacingCharacters(in: local, with: l.text) as NSString
+            if let r = l.selection {
+                let abs = NSRange(location: span.location + local.location + r.location, length: r.length)
+                newSelection = newSelection.map { NSUnionRange($0, abs) } ?? abs
+            }
+            offsetShift += (l.text as NSString).length - l.range.length
         }
-        let inner = sel.length > 0 ? ns.substring(with: sel) : placeholder
-        if inner.hasPrefix(marker), inner.hasSuffix(marker), (inner as NSString).length >= 2 * m {
-            let stripped = (inner as NSString).substring(with: NSRange(location: m, length: (inner as NSString).length - 2 * m))
-            replace(sel, with: stripped, caret: nil, select: NSRange(location: sel.location, length: (stripped as NSString).length))
-            return
-        }
-        replace(sel, with: marker + inner + marker, caret: nil,
-                select: NSRange(location: sel.location + m, length: (inner as NSString).length))
+        replace(span, with: result as String, caret: nil, select: newSelection ?? NSRange(location: span.location, length: result.length))
     }
 
-    private func wordRange(at location: Int) -> NSRange {
+    /// Compatibility shim for callers that think in markers.
+    func toggleWrap(_ marker: String) {
+        switch marker {
+        case "**", "__": toggleFormat(.bold)
+        case "*", "_": toggleFormat(.italic)
+        case "~~": toggleFormat(.strike)
+        case "==": toggleFormat(.highlight)
+        default: toggleFormat(.code)
+        }
+    }
+
+    /// A line's range without its newline.
+    func contentLineRange(at location: Int) -> NSRange {
+        let ns = string as NSString
+        var line = ns.lineRange(for: NSRange(location: min(location, ns.length), length: 0))
+        if line.length > 0, ns.character(at: NSMaxRange(line) - 1) == 10 { line.length -= 1 }
+        return line
+    }
+
+    /// Lines inside fenced code, images, dividers and table dividers take no inline formatting.
+    private func isFormattableLine(_ line: NSRange) -> Bool {
+        guard let s = textStorage, line.length > 0 else { return false }
+        if s.attribute(.typeCodeBlock, at: line.location, effectiveRange: nil) != nil { return false }
+        if s.attribute(.typeAtomic, at: line.location, effectiveRange: nil) != nil { return false }
+        let text = (string as NSString).substring(with: line)
+        if MDPattern.blockImage.firstMatch(in: text, range: NSRange(location: 0, length: line.length)) != nil { return false }
+        return true
+    }
+
+    private func togglePendingFormat(_ format: InlineFormat, at location: Int) {
+        if pendingFormatLocation != location { pendingFormats = [:]; pendingFormatLocation = location }
+        if pendingFormats[format] != nil { pendingFormats[format] = nil; return }
+        let line = contentLineRange(at: location)
+        guard isFormattableLine(line) || line.length == 0 else { NSSound.beep(); return }
+        let text = (string as NSString).substring(with: line)
+        let active = InlineFormatter.isActive(format, in: text, segment: NSRange(location: location - line.location, length: 0))
+        pendingFormats[format] = !active
+    }
+
+    /// Types `typed` with the pending formats: wrapped in new markers, or
+    /// stepped outside the closing markers of a format being turned off.
+    private func insertWithPendingFormats(_ typed: String) -> Bool {
+        let sel = selectedRange()
+        guard !pendingFormats.isEmpty else { return false }
+        guard sel.length == 0, sel.location == pendingFormatLocation else { pendingFormats = [:]; return false }
+        var loc = sel.location
+        var on = Set(pendingFormats.filter { $0.value }.keys)
+        let off = Set(pendingFormats.filter { !$0.value }.keys)
+        pendingFormats = [:]
+        for format in off {
+            if let exit = exitPoint(of: format, at: loc) { loc = exit.location; on.formUnion(exit.reopen) }
+        }
+        on.subtract(off)
+        let ns = string as NSString
+        let typedLength = (typed as NSString).length
+        if on.isEmpty {
+            guard loc != sel.location else { return false }
+            replace(NSRange(location: loc, length: 0), with: typed, caret: loc + typedLength)
+            return true
+        }
+        let before: unichar? = loc > 0 ? ns.character(at: loc - 1) : nil
+        let after: unichar? = loc < ns.length ? ns.character(at: loc) : nil
+        let (open, close) = InlineFormatter.wrap(typed, in: on, before: before, after: after)
+        replace(NSRange(location: loc, length: 0), with: open + typed + close, caret: loc + (open as NSString).length + typedLength)
+        return true
+    }
+
+    /// Where to type so new text falls outside `format`'s span around the caret.
+    private func exitPoint(of format: InlineFormat, at location: Int) -> (location: Int, reopen: Set<InlineFormat>)? {
+        let ns = string as NSString
+        let lineRange = contentLineRange(at: location)
+        let line = ns.substring(with: lineRange) as NSString
+        let local = location - lineRange.location
+        let spans = InlineFormatter.spans(in: line as String)
+        guard let span = spans.filter({ $0.formats.contains(format) && $0.content.location <= local && local <= NSMaxRange($0.content) })
+            .min(by: { $0.content.length < $1.content.length }) else { return nil }
+        func onlyMarkers(_ from: Int, _ to: Int) -> Bool {
+            (from..<max(from, to)).allSatisfy { "*_~=`".utf16.contains(line.character(at: $0)) }
+        }
+        var reopen = span.formats.subtracting([format])
+        if onlyMarkers(local, NSMaxRange(span.content)) {
+            for s in spans where s != span && s.close.location >= local && NSMaxRange(s.close) <= span.close.location { reopen.formUnion(s.formats) }
+            return (lineRange.location + NSMaxRange(span.close), reopen)
+        }
+        if onlyMarkers(span.content.location, local) {
+            for s in spans where s != span && s.open.location >= NSMaxRange(span.open) && NSMaxRange(s.open) <= local { reopen.formUnion(s.formats) }
+            return (lineRange.location + span.open.location, reopen)
+        }
+        return nil
+    }
+
+    func wordRange(at location: Int) -> NSRange {
         let ns = string as NSString
         guard ns.length > 0 else { return NSRange(location: location, length: 0) }
         var start = location, end = location
@@ -490,6 +684,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
 
     func layoutManager(_ layoutManager: NSLayoutManager, didCompleteLayoutFor textContainer: NSTextContainer?, atEnd layoutFinishedFlag: Bool) {
         scheduleImageLayout()
+        scheduleCaretUpdate(animated: false)
     }
 
     private func isHidden(_ i: Int) -> Bool {
@@ -505,6 +700,11 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     /// Keeps the caret out of the middle of hidden syntax, and after hidden line prefixes.
     override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
         var ranges = ranges
+        if ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0, r.location <= (string as NSString).length {
+            let old = selectedRange().location
+            let loc = snapOutOfAtomicLines(r.location, forward: r.location >= old)
+            if loc != r.location { ranges = [NSValue(range: NSRange(location: loc, length: 0))] }
+        }
         if config?.hideSyntax == true, ranges.count == 1, let r = ranges.first?.rangeValue, r.length == 0 {
             let old = selectedRange().location
             var loc = r.location
@@ -519,13 +719,140 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             if loc != r.location { ranges = [NSValue(range: NSRange(location: loc, length: 0))] }
         }
         super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        if let r = ranges.first?.rangeValue, r.length > 0 || r.location != pendingFormatLocation { pendingFormats = [:] }
         updateImageSelection()
+        scheduleCaretUpdate(animated: !stillSelecting && NSApp.currentEvent?.type == .keyDown)
+    }
+
+    // MARK: Atomic lines (images, dividers, hidden code fences)
+
+    /// The atomic line at `location` (its range without the newline), if any.
+    func atomicLine(at location: Int) -> (range: NSRange, kind: AtomicKind)? {
+        guard let s = textStorage, s.length > 0, location <= s.length else { return nil }
+        let line = contentLineRange(at: location)
+        guard line.length > 0, NSLocationInRange(location, NSRange(location: line.location, length: line.length + 1)),
+              let raw = s.attribute(.typeAtomic, at: line.location, effectiveRange: nil) as? String,
+              let kind = AtomicKind(rawValue: raw) else { return nil }
+        return (line, kind)
+    }
+
+    /// Moves a caret position off atomic lines: to the next line when moving
+    /// forward, to the end of the previous line when moving back.
+    func snapOutOfAtomicLines(_ location: Int, forward: Bool) -> Int {
+        let length = (string as NSString).length
+        var loc = location
+        for _ in 0..<64 {
+            guard let a = atomicLine(at: loc) else { return loc }
+            let end = NSMaxRange(a.range)
+            if forward {
+                guard end < length else { return end }
+                loc = end + 1
+            } else if a.range.location > 0 {
+                loc = a.range.location - 1
+            } else if end < length {
+                loc = end + 1
+            } else {
+                return a.range.location
+            }
+        }
+        return loc
+    }
+
+    /// Typing next to (or over) an image or divider puts the text on its own line.
+    private func typeBesideAtomicLine(_ typed: String) -> Bool {
+        let sel = selectedRange()
+        guard let a = atomicLine(at: sel.location) else { return false }
+        let typedLength = (typed as NSString).length
+        let end = NSMaxRange(a.range)
+        if sel.length > 0 {
+            guard NSMaxRange(sel) <= end, a.kind == .image || a.kind == .rule else { return false }
+            replace(NSRange(location: end, length: 0), with: "\n" + typed, caret: end + 1 + typedLength)
+            return true
+        }
+        if sel.location == end {
+            replace(NSRange(location: end, length: 0), with: "\n" + typed, caret: end + 1 + typedLength)
+            return true
+        }
+        if sel.location == a.range.location {
+            replace(NSRange(location: sel.location, length: 0), with: typed + "\n", caret: sel.location + typedLength)
+            return true
+        }
+        return false
+    }
+
+    /// Return with an image selected opens a new line below it.
+    private func newlineAfterSelectedAtomicLine() -> Bool {
+        let sel = selectedRange()
+        guard sel.length > 0, let a = atomicLine(at: sel.location), NSMaxRange(sel) <= NSMaxRange(a.range) else { return false }
+        let end = NSMaxRange(a.range)
+        replace(NSRange(location: end, length: 0), with: "\n", caret: end + 1)
+        return true
+    }
+
+    /// Deletes a selected image or divider, line and all.
+    private func deleteSelectedAtomicLine(_ sel: NSRange) -> Bool {
+        guard sel.length > 0, let a = atomicLine(at: sel.location), NSMaxRange(sel) <= NSMaxRange(a.range),
+              a.kind == .image || a.kind == .rule else { return false }
+        deleteLine(containing: a.range)
+        return true
+    }
+
+    /// Backspace at the start of the line after an image or divider selects
+    /// it (a second Backspace deletes it); after a hidden code fence or table
+    /// divider it steps over it instead of merging lines.
+    private func backspaceAfterAtomicLine(at loc: Int) -> Bool {
+        let ns = string as NSString
+        guard loc > 0, ns.character(at: loc - 1) == 10, let a = atomicLine(at: loc - 1), NSMaxRange(a.range) == loc - 1 else { return false }
+        let current = contentLineRange(at: loc)
+        if current.length == 0, NSMaxRange(current) < ns.length {
+            // An empty line below an image: remove the empty line, keep the image.
+            replace(NSRange(location: loc, length: 1), with: "", caret: loc)
+            return true
+        }
+        switch a.kind {
+        case .image, .rule:
+            setSelectedRange(a.range)
+        case .fence, .tableDivider:
+            if a.range.location > 0 { super.setSelectedRanges([NSValue(range: NSRange(location: a.range.location - 1, length: 0))], affinity: .downstream, stillSelecting: false) }
+        }
+        return true
+    }
+
+    /// Forward Delete at the end of the line before an image or divider selects it.
+    private func deleteForwardBeforeAtomicLine(at loc: Int) -> Bool {
+        let ns = string as NSString
+        guard loc < ns.length, ns.character(at: loc) == 10, let a = atomicLine(at: loc + 1), a.range.location == loc + 1 else { return false }
+        switch a.kind {
+        case .image, .rule:
+            setSelectedRange(a.range)
+        case .fence, .tableDivider:
+            if NSMaxRange(a.range) < ns.length { setSelectedRange(NSRange(location: NSMaxRange(a.range) + 1, length: 0)) }
+        }
+        return true
+    }
+
+    /// Removes the whole line containing `range`, newline included.
+    func deleteLine(containing range: NSRange) {
+        let ns = string as NSString
+        var line = ns.lineRange(for: range)
+        if NSMaxRange(line) == ns.length, line.location > 0, line.length > 0, ns.character(at: NSMaxRange(line) - 1) != 10 {
+            line = NSRange(location: line.location - 1, length: line.length + 1)
+        }
+        replace(line, with: "", caret: line.location)
     }
 
     /// Backspace that respects hidden markers: never silently deletes syntax.
     override func deleteBackward(_ sender: Any?) {
         let sel = selectedRange()
-        guard config?.hideSyntax == true, sel.length == 0, sel.location > 0 else { super.deleteBackward(sender); return }
+        if deleteSelectedAtomicLine(sel) { return }
+        if sel.length == 0, backspaceAfterAtomicLine(at: sel.location) { return }
+        if sel.length == 0, stepOverTablePipe(backward: true, at: sel.location) { return }
+        guard config?.hideSyntax == true, sel.length == 0, sel.location > 0 else {
+            let ghost = sel.length == 0 && sel.location > 0 ? captureGhost(of: (string as NSString).rangeOfComposedCharacterSequence(at: sel.location - 1)) : nil
+            super.deleteBackward(sender)
+            if let ghost { caretOverlay.fadeOutGhost(ghost.image, frame: ghost.frame) }
+            return
+        }
         let ns = string as NSString
         var loc = sel.location
         if isHiddenPrefix(loc - 1) {
@@ -540,10 +867,22 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             guard loc > 0 else { return }
             if isHiddenPrefix(loc - 1) { super.setSelectedRanges([NSValue(range: NSRange(location: loc, length: 0))], affinity: .downstream, stillSelecting: false); deleteBackward(sender); return }
             let target = ns.rangeOfComposedCharacterSequence(at: loc - 1)
+            let ghost = captureGhost(of: target)
             replace(target, with: "", caret: target.location)
+            if let ghost { caretOverlay.fadeOutGhost(ghost.image, frame: ghost.frame) }
             return
         }
+        let ghost = captureGhost(of: ns.rangeOfComposedCharacterSequence(at: loc - 1))
         super.deleteBackward(sender)
+        if let ghost { caretOverlay.fadeOutGhost(ghost.image, frame: ghost.frame) }
+    }
+
+    override func deleteForward(_ sender: Any?) {
+        let sel = selectedRange()
+        if deleteSelectedAtomicLine(sel) { return }
+        if sel.length == 0, deleteForwardBeforeAtomicLine(at: sel.location) { return }
+        if sel.length == 0, stepOverTablePipe(backward: false, at: sel.location) { return }
+        super.deleteForward(sender)
     }
 
     // MARK: Decorations (quote bars, rules, checkboxes)
@@ -618,13 +957,22 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
         }
 
-        // Horizontal rules
-        NSColor.separatorColor.setFill()
+        // Horizontal rules (accent-colored while selected, before Backspace deletes them)
+        let selection = selectedRange()
         for (range, _) in attributeRuns(.typeRule, in: visible) {
             let g = lm.glyphIndexForCharacter(at: range.location)
             let frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
             let y = frag.midY + textContainerOrigin.y
-            NSRect(x: textContainerOrigin.x, y: y.rounded(), width: columnWidth, height: 1).fill()
+            let selected = selection.length > 0 && NSIntersectionRange(selection, range).length > 0
+            (selected ? NSColor.controlAccentColor : NSColor.separatorColor).setFill()
+            NSRect(x: textContainerOrigin.x, y: y.rounded() - (selected ? 0.5 : 0), width: columnWidth, height: selected ? 2 : 1).fill()
+        }
+
+        // Tables
+        var drawnTables = Set<Int>()
+        for (_, value) in attributeRuns(.typeTable, in: visible) {
+            guard let table = (value as? NSValue)?.rangeValue, drawnTables.insert(table.location).inserted else { continue }
+            drawTableGrid(table)
         }
 
         // Checkboxes
@@ -701,10 +1049,8 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
     }
 
     func deleteImage(range: NSRange) {
-        let ns = string as NSString
-        guard NSMaxRange(range) <= ns.length else { return }
-        let line = ns.lineRange(for: range)
-        replace(line, with: "", caret: line.location)
+        guard NSMaxRange(range) <= (string as NSString).length else { return }
+        deleteLine(containing: range)
     }
 
     /// Inserts saved images, each on its own line, at `location`.
@@ -781,6 +1127,194 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         return rect.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
     }
 
+    // MARK: Caret & smooth typing
+
+    /// Repositions the caret after the current event (coalesced).
+    func scheduleCaretUpdate(animated: Bool) {
+        caretAnimates = caretAnimates || animated
+        guard !caretUpdateScheduled else { return }
+        caretUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.flushCaretUpdate() }
+        }
+    }
+
+    private func flushCaretUpdate() {
+        caretUpdateScheduled = false
+        let animate = caretAnimates && smoothTyping
+        caretAnimates = false
+        guard caretOverlay.superview === self else { return }
+        let active = window?.isKeyWindow == true && window?.firstResponder === self
+        guard let frame = caretFrame() else { caretOverlay.isCaretVisible = false; return }
+        let old = caretOverlay.target
+        let near = !old.isNull && hypot(frame.midX - old.midX, frame.midY - old.midY) < 600
+        caretOverlay.move(to: frame, animated: animate && near && caretOverlay.isCaretVisible && active)
+        caretOverlay.isCaretVisible = active
+    }
+
+    /// The caret: as tall as the text being typed (not the line, so blank
+    /// lines, headings' spacing and images don't stretch or squash it), sitting
+    /// on the line's baseline.
+    func caretFrame() -> NSRect? {
+        guard let config, !config.hideCaret, let lm = layoutManager, let tc = textContainer else { return nil }
+        let sel = selectedRange()
+        guard sel.length == 0 else { return nil }
+        let ns = string as NSString
+        let len = ns.length
+        let loc = min(sel.location, len)
+        if let a = atomicLine(at: loc), loc > a.range.location || loc == NSMaxRange(a.range) { return nil }
+        let font = caretFont(at: loc)
+        let ascent = font.ascender, descent = -font.descender
+        var count = 0
+        guard let rects = lm.rectArray(forCharacterRange: NSRange(location: loc, length: 0),
+                                       withinSelectedCharacterRange: NSRange(location: loc, length: 0), in: tc, rectCount: &count),
+              count > 0 else { return nil }
+        let native = rects[0]
+        var baseline: CGFloat
+        if len == 0 || (loc == len && ns.character(at: len - 1) == 10) {
+            let used = lm.extraLineFragmentUsedRect
+            baseline = used.isEmpty ? native.maxY - descent : used.maxY - descent
+        } else {
+            let g = lm.glyphIndexForCharacter(at: loc < len ? loc : len - 1)
+            let frag = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+            baseline = frag.minY + lm.location(forGlyphAt: g).y
+            let used = lm.lineFragmentUsedRect(forGlyphAt: g, effectiveRange: nil)
+            if used.height < ascent + descent {
+                // Short (blank) lines: center the caret on the line.
+                baseline = used.midY + (ascent - descent) / 2
+            }
+        }
+        let width: CGFloat = 2
+        return NSRect(x: native.minX - width / 2 + textContainerOrigin.x, y: baseline - ascent + textContainerOrigin.y,
+                      width: width, height: ascent + descent)
+    }
+
+    private func caretFont(at loc: Int) -> NSFont {
+        let ns = string as NSString
+        if let s = textStorage {
+            if loc > 0, ns.character(at: loc - 1) != 10, let f = s.attribute(.font, at: loc - 1, effectiveRange: nil) as? NSFont { return f }
+            if loc < ns.length, ns.character(at: loc) != 10, let f = s.attribute(.font, at: loc, effectiveRange: nil) as? NSFont { return f }
+        }
+        return (typingAttributes[.font] as? NSFont) ?? .systemFont(ofSize: config?.fontSize ?? 17)
+    }
+
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+        if ok, let replacementString, !fades.isEmpty { shiftFades(for: affectedCharRange, newLength: (replacementString as NSString).length) }
+        return ok
+    }
+
+    /// Keeps in-flight fades on their characters as text before them changes.
+    private func shiftFades(for edited: NSRange, newLength: Int) {
+        let delta = newLength - edited.length
+        let length = (string as NSString).length
+        fades = fades.compactMap { fade in
+            if NSMaxRange(fade.range) <= edited.location { return fade }
+            if fade.range.location >= NSMaxRange(edited) {
+                return (NSRange(location: fade.range.location + delta, length: fade.range.length), fade.start)
+            }
+            let r = NSIntersectionRange(fade.range, NSRange(location: 0, length: length))
+            if r.length > 0 { layoutManager?.removeTemporaryAttribute(.foregroundColor, forCharacterRange: r) }
+            return nil
+        }
+    }
+
+    /// Fades the character just typed in, like Word's animated typing.
+    private func fadeInCharacterBeforeCaret() {
+        guard smoothTyping else { return }
+        let sel = selectedRange()
+        let ns = string as NSString
+        guard sel.length == 0, sel.location > 0, sel.location <= ns.length else { return }
+        let r = ns.rangeOfComposedCharacterSequence(at: sel.location - 1)
+        guard !isHidden(r.location), let u = UnicodeScalar(ns.character(at: r.location)),
+              !CharacterSet.whitespacesAndNewlines.contains(u) else { return }
+        fades.append((r, CACurrentMediaTime()))
+        applyFades()
+        if fadeLink == nil {
+            let link = displayLink(target: self, selector: #selector(fadeTick(_:)))
+            link.add(to: .main, forMode: .common)
+            fadeLink = link
+        }
+    }
+
+    @objc private func fadeTick(_ link: CADisplayLink) {
+        applyFades()
+        if fades.isEmpty {
+            link.invalidate()
+            fadeLink = nil
+        }
+    }
+
+    /// Paints each fading character at its current opacity (as a temporary
+    /// attribute, so the document's own colors are untouched).
+    func applyFades() {
+        guard !fades.isEmpty, let lm = layoutManager, let s = textStorage else { return }
+        let now = CACurrentMediaTime()
+        let all = NSRange(location: 0, length: s.length)
+        var remaining: [(range: NSRange, start: CFTimeInterval)] = []
+        for fade in fades {
+            let r = NSIntersectionRange(fade.range, all)
+            guard r.length > 0 else { continue }
+            let t = min(1, max(0, (now - fade.start) / Self.fadeDuration))
+            if t >= 1 {
+                lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: r)
+                if let config, config.focusMode, let focused = focusedParagraph, NSIntersectionRange(focused, r).length == 0 {
+                    lm.addTemporaryAttribute(.foregroundColor, value: NSColor.labelColor.dynamicAlpha(max(0.05, config.focusOpacity)), forCharacterRange: r)
+                }
+                continue
+            }
+            let eased = CGFloat(1 - pow(1 - t, 2.4))
+            s.enumerateAttribute(.foregroundColor, in: r) { value, run, _ in
+                let base = (value as? NSColor) ?? .labelColor
+                lm.addTemporaryAttribute(.foregroundColor, value: base.dynamicAlphaScaled(0.1 + 0.9 * eased), forCharacterRange: run)
+            }
+            remaining.append(fade)
+        }
+        fades = remaining
+    }
+
+    /// Drops in-flight effects (used when the whole text is replaced).
+    func resetTypingEffects() {
+        if !fades.isEmpty, let lm = layoutManager {
+            lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: (string as NSString).length))
+        }
+        fades = []
+        pendingFormats = [:]
+    }
+
+    /// An image of the glyphs in `range`, for fading out after they're
+    /// deleted. Only when nothing visible follows on the line (text closing up
+    /// over a ghost would look muddled).
+    private func captureGhost(of range: NSRange) -> (image: CGImage, frame: NSRect)? {
+        guard smoothTyping, NSApp.currentEvent?.type == .keyDown, let lm = layoutManager, let tc = textContainer else { return nil }
+        let ns = string as NSString
+        guard range.length > 0, NSMaxRange(range) <= ns.length, !isHidden(range.location),
+              !ns.substring(with: range).contains("\n") else { return nil }
+        let lineEnd = NSMaxRange(contentLineRange(at: range.location))
+        var i = NSMaxRange(range)
+        while i < lineEnd { if !isHidden(i) { return nil }; i += 1 }
+        let glyphs = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        guard glyphs.length > 0 else { return nil }
+        let rect = lm.boundingRect(forGlyphRange: glyphs, in: tc)
+            .offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+            .insetBy(dx: -2, dy: -1).integral
+        guard rect.width > 0, rect.height > 0, rect.width < 600 else { return nil }
+        let scale = window?.backingScaleFactor ?? 2
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: Int(rect.width * scale), height: Int(rect.height * scale), bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.translateBy(x: 0, y: rect.height * scale)
+        ctx.scaleBy(x: scale, y: -scale)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: true)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            lm.drawGlyphs(forGlyphRange: glyphs, at: NSPoint(x: textContainerOrigin.x - rect.minX, y: textContainerOrigin.y - rect.minY))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let image = ctx.makeImage() else { return nil }
+        return (image, rect)
+    }
+
     // MARK: Typewriter & focus
 
     func centerCaretIfNeeded(animated: Bool = true) {
@@ -810,6 +1344,7 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
             if focusedParagraph != nil || force {
                 lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: full)
                 focusedParagraph = nil
+                applyFades()
             }
             return
         }
@@ -824,5 +1359,6 @@ final class TypeTextView: NSTextView, NSLayoutManagerDelegate {
         if NSMaxRange(current) < ns.length {
             lm.addTemporaryAttribute(.foregroundColor, value: dim, forCharacterRange: NSRange(location: NSMaxRange(current), length: ns.length - NSMaxRange(current)))
         }
+        applyFades()
     }
 }

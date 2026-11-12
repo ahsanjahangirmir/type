@@ -139,6 +139,9 @@ struct SlashMenu: View {
     @ObservedObject var controller: EditorController
     let state: SlashState
 
+    static let width: CGFloat = 250
+    static func height(for count: Int) -> CGFloat { min(CGFloat(max(count, 1)) * 44 + 12, 320) }
+
     var body: some View {
         let items = controller.filteredSlashCommands
         VStack(alignment: .leading, spacing: 2) {
@@ -180,7 +183,7 @@ struct SlashMenu: View {
                 }
             }
         }
-        .frame(width: 250, height: min(CGFloat(max(items.count, 1)) * 44 + 12, 320))
+        .frame(width: Self.width, height: Self.height(for: items.count))
         .glassEffect(.regular, in: .rect(cornerRadius: 16))
         .shadow(color: .black.opacity(0.12), radius: 16, y: 6)
     }
@@ -213,5 +216,66 @@ struct OutlineSidebar: View {
                 .listStyle(.sidebar)
             }
         }
+    }
+}
+
+// MARK: - Link editor
+
+/// The ⌘K popover: a URL field (and a text field when nothing was selected).
+struct LinkEditorView: View {
+    @State var label: String
+    @State var url: String
+    let needsLabel: Bool
+    let isExisting: Bool
+    let onApply: (String, String) -> Void
+    let onRemove: () -> Void
+    let onCancel: () -> Void
+
+    private enum Field { case label, url }
+    @FocusState private var focus: Field?
+
+    private var canApply: Bool { !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if needsLabel {
+                field("textformat", "Text to display", text: $label, focus: .label)
+            }
+            field("link", "Paste or type a link", text: $url, focus: .url)
+            HStack(spacing: 8) {
+                if isExisting {
+                    Button("Remove Link", role: .destructive, action: onRemove)
+                }
+                Spacer()
+                Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
+                Button(isExisting ? "Update" : "Add Link", action: apply)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canApply)
+            }
+            .controlSize(.regular)
+        }
+        .padding(14)
+        .frame(width: 340)
+        .onAppear {
+            DispatchQueue.main.async { focus = needsLabel ? .label : .url }
+        }
+    }
+
+    private func field(_ symbol: String, _ prompt: String, text: Binding<String>, focus field: Field) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 16)
+            TextField(prompt, text: text)
+                .textFieldStyle(.plain)
+                .focused($focus, equals: field)
+                .onSubmit { if field == .label { focus = .url } else { apply() } }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 9))
+    }
+
+    private func apply() {
+        guard canApply else { return }
+        onApply(label, url)
     }
 }

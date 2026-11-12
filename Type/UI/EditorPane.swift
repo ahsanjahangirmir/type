@@ -31,6 +31,7 @@ struct EditorPane: View {
     @State private var goal = 0
     @State private var goalCelebrated = false
     @State private var showGoalToast = false
+    @State private var editorSize: CGSize = .zero
 
     private var chromeShown: Bool { controller.chromeVisible || !settings.autoHideChrome }
 
@@ -38,6 +39,7 @@ struct EditorPane: View {
         EditorTextView(text: $text, config: settings.editorConfig, controller: controller,
                        baseURL: fileURL?.deletingLastPathComponent(), undoManager: undoManager, documentID: documentID)
             .ignoresSafeArea(.container, edges: .top)
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { editorSize = $0 }
             .overlay(alignment: .topLeading) { slashOverlay }
             .overlay(alignment: .bottom) {
                 VStack(spacing: 10) {
@@ -77,12 +79,19 @@ struct EditorPane: View {
             }
     }
 
+    /// The slash menu opens below the caret, or above it when there isn't room
+    /// (near the bottom of the window, above the statistics pill).
     @ViewBuilder
     private var slashOverlay: some View {
         if let slash = controller.slash {
+            let height = SlashMenu.height(for: controller.filteredSlashCommands.count)
+            let bottomLimit = editorSize.height - (settings.showStats ? 64 : 16)
+            let below = editorSize.height == 0 || slash.rect.maxY + 8 + height <= bottomLimit || slash.rect.minY - 8 - height < 8
+            let x = min(max(12, slash.rect.minX - 10), max(12, editorSize.width - SlashMenu.width - 12))
+            let y = below ? slash.rect.maxY + 8 : slash.rect.minY - 8 - height
             SlashMenu(controller: controller, state: slash)
-                .offset(x: max(12, slash.rect.minX - 10), y: slash.rect.maxY + 8)
-                .transition(.scale(scale: 0.92, anchor: .topLeading).combined(with: .opacity))
+                .offset(x: x, y: max(8, y))
+                .transition(.scale(scale: 0.92, anchor: below ? .topLeading : .bottomLeading).combined(with: .opacity))
         }
     }
 
