@@ -43,6 +43,7 @@ struct EditorTextView: NSViewRepresentable {
         tv.isIncrementalSearchingEnabled = true
         tv.isAutomaticQuoteSubstitutionEnabled = false
         tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextCompletionEnabled = false
         tv.isContinuousSpellCheckingEnabled = true
         tv.smartInsertDeleteEnabled = true
         tv.allowsDocumentBackgroundColorChange = false
@@ -184,6 +185,7 @@ struct EditorTextView: NSViewRepresentable {
 
         func load(_ text: String, into tv: TypeTextView) {
             let selection = tv.selectedRange()
+            tv.resetTypingEffects()
             tv.string = text
             restyle(tv, range: nil)
             tv.typingAttributes = styler.baseAttributes
@@ -203,6 +205,12 @@ struct EditorTextView: NSViewRepresentable {
             blocks = newBlocks
             styler.columnWidth = tv.columnWidth
             styler.style(storage, range: target, blocks: newBlocks)
+            if tv.hasMarkedText() {
+                // Keep the input method's underline on text still being composed.
+                let marked = tv.markedRange()
+                if NSMaxRange(marked) <= storage.length { storage.addAttributes(tv.markedTextAttributes ?? [:], range: marked) }
+            }
+            tv.scheduleCaretUpdate(animated: false)
             hasImages = (storage.string as NSString).range(of: "![").location != NSNotFound
             tv.refreshFocusDimming(force: true)
             tv.scheduleImageLayout()
@@ -272,6 +280,21 @@ struct EditorTextView: NSViewRepresentable {
             item.submenu = format
             menu.insertItem(item, at: 0)
             menu.insertItem(.separator(), at: 1)
+            if let tv = textView as? TypeTextView, tv.tableContext(at: charIndex) != nil {
+                let table = NSMenu(title: "Table")
+                let edits: [(String, TypeTextView.TableEdit)] = [
+                    ("Insert Row Above", .rowAbove), ("Insert Row Below", .rowBelow),
+                    ("Insert Column Left", .columnLeft), ("Insert Column Right", .columnRight),
+                    ("Delete Row", .deleteRow), ("Delete Column", .deleteColumn), ("Delete Table", .deleteTable),
+                ]
+                for (n, (title, edit)) in edits.enumerated() {
+                    if n == 4 || n == 6 { table.addItem(.separator()) }
+                    table.addItem(ClosureMenuItem(title: title) { [weak tv] in tv?.editTable(edit, at: charIndex) })
+                }
+                let tableItem = NSMenuItem(title: "Table", action: nil, keyEquivalent: "")
+                tableItem.submenu = table
+                menu.insertItem(tableItem, at: 1)
+            }
             return menu
         }
 

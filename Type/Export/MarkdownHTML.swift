@@ -102,13 +102,24 @@ enum MarkdownHTML {
     private static func list(_ lines: [String]) -> String {
         guard let first = lines.first, let fm = MDPattern.list.firstMatch(in: first, range: NSRange(location: 0, length: (first as NSString).length)) else { return "" }
         let baseIndent = indentWidth(first)
-        let ordered = (first as NSString).substring(with: fm.range(at: 2)).first?.isNumber == true
-        var html = ordered ? "<ol>\n" : "<ul>\n"
+        func opening(_ marker: String) -> String {
+            guard let n = Int(marker.dropLast()) else { return "<ul>\n" }
+            return n == 1 ? "<ol>\n" : "<ol start=\"\(n)\">\n"
+        }
+        var ordered = (first as NSString).substring(with: fm.range(at: 2)).first?.isNumber == true
+        var html = opening((first as NSString).substring(with: fm.range(at: 2)))
         var idx = 0
         while idx < lines.count {
             let line = lines[idx]
             let ns = line as NSString
             guard let m = MDPattern.list.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)), indentWidth(line) <= baseIndent else { idx += 1; continue }
+            // A bullet run followed by a numbered run (or back) is two lists.
+            let marker = ns.substring(with: m.range(at: 2))
+            let isOrdered = marker.first?.isNumber == true
+            if isOrdered != ordered {
+                html += (ordered ? "</ol>\n" : "</ul>\n") + opening(marker)
+                ordered = isOrdered
+            }
             var content = ns.substring(from: m.range.length)
             var cls = ""
             if m.range(at: 3).location != NSNotFound {
@@ -180,8 +191,9 @@ enum MarkdownHTML {
             (#"\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;([^&]*)&quot;)?\)"#, "<a href=\"$2\">$1</a>"),
             (#"(?<![\"=>])\b(https?://[^\s<]+[^\s<.,;:!?)])"#, "<a href=\"$1\">$1</a>"),
             (#"(\*\*\*|___)(?=\S)(.+?)(?<=\S)\1"#, "<strong><em>$2</em></strong>"),
-            (#"(\*\*|__)(?=\S)(.+?)(?<=\S)\1"#, "<strong>$2</strong>"),
-            (#"(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])"#, "<em>$1</em>"),
+            (#"(?<!\*)\*\*(?=\S)(.+?)(?<=\S)\*\*(?!\*)"#, "<strong>$1</strong>"),
+            (#"(?<![_\w])__(?=\S)(.+?)(?<=\S)__(?![_\w])"#, "<strong>$1</strong>"),
+            (#"(?<!\*)\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?!\*)"#, "<em>$1</em>"),
             (#"(?<![_\w])_(?=[^\s_])(.+?)(?<=[^\s_])_(?![_\w])"#, "<em>$1</em>"),
             (#"~~(?=\S)(.+?)(?<=\S)~~"#, "<del>$1</del>"),
             (#"==(?=\S)(.+?)(?<=\S)=="#, "<mark>$1</mark>"),

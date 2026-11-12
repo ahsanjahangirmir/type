@@ -142,6 +142,10 @@ private struct TypographySettings: View {
                     }
                 }
                 Toggle("Hide caret", isOn: $settings.hideCaret)
+                Toggle(isOn: $settings.smoothTyping) {
+                    Text("Smooth typing")
+                    Text("The caret glides as you type and letters fade in and out.")
+                }
             }
             Section("Selection") {
                 Picker("Selection color", selection: $settings.selectionColor) {

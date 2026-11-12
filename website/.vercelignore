@@ -1,0 +1,16 @@
+node_modules
+.shots
+.shots-pass1
+.shots-pass2
+.astro
+.vscode
+scripts
+QA.md
+README.md
+.env*
+.vercel
+AGENTS.md
+public/media/PROVENANCE.md
+dist
+.shots-final
+.shots*

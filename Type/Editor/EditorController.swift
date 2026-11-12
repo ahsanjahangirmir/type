@@ -75,11 +75,11 @@ final class EditorController: ObservableObject {
 
     // MARK: Formatting
 
-    func bold() { textView?.toggleWrap("**") }
-    func italic() { textView?.toggleWrap("*") }
-    func strikethrough() { textView?.toggleWrap("~~") }
-    func highlight() { textView?.toggleWrap("==") }
-    func inlineCode() { textView?.toggleWrap("`") }
+    func bold() { textView?.toggleFormat(.bold) }
+    func italic() { textView?.toggleFormat(.italic) }
+    func strikethrough() { textView?.toggleFormat(.strike) }
+    func highlight() { textView?.toggleFormat(.highlight) }
+    func inlineCode() { textView?.toggleFormat(.code) }
     func heading(_ level: Int) {
         if level == 0 { textView?.setLinePrefix("", kind: .heading) }
         else { textView?.setLinePrefix(String(repeating: "#", count: level) + " ", kind: .heading) }
@@ -89,18 +89,33 @@ final class EditorController: ObservableObject {
     func taskList() { textView?.setLinePrefix("- [ ] ", kind: .task) }
     func quote() { textView?.setLinePrefix("> ", kind: .quote) }
 
+    private var linkPopover: NSPopover?
+
+    /// ⌘K: a small popover to add, edit or remove the link at the selection.
     func link() {
-        guard let tv = textView else { return }
-        let ns = tv.string as NSString
-        let sel = tv.selectedRange()
-        let label = sel.length > 0 ? ns.substring(with: sel) : "link"
+        guard let tv = textView, tv.window != nil else { return }
+        linkPopover?.close()
+        let target = tv.linkTarget()
         let clipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let url = (clipboard.flatMap { URL(string: $0) }?.scheme?.hasPrefix("http") == true) ? clipboard! : "https://"
-        let text = "[\(label)](\(url))"
-        let urlStart = sel.location + (label as NSString).length + 3
-        tv.replace(sel, with: text, caret: nil, select: sel.length > 0
-            ? NSRange(location: urlStart, length: (url as NSString).length)
-            : NSRange(location: sel.location + 1, length: (label as NSString).length))
+        let clipURL = clipboard.flatMap { URL(string: $0) }?.scheme?.hasPrefix("http") == true ? clipboard : nil
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        let finish: () -> Void = { [weak popover, weak tv] in
+            popover?.close()
+            if let tv { tv.window?.makeFirstResponder(tv) }
+        }
+        let editor = LinkEditorView(
+            label: target.label, url: target.isExisting ? target.url : (clipURL ?? ""),
+            needsLabel: target.label.isEmpty, isExisting: target.isExisting,
+            onApply: { [weak tv] label, url in finish(); tv?.applyLink(target, label: label, url: url) },
+            onRemove: { [weak tv] in finish(); tv?.removeLink(target) },
+            onCancel: finish)
+        let host = NSHostingController(rootView: editor)
+        host.sizingOptions = .preferredContentSize
+        popover.contentViewController = host
+        popover.show(relativeTo: tv.firstLineRect(for: target.range).insetBy(dx: 0, dy: -2), of: tv, preferredEdge: .maxY)
+        linkPopover = popover
     }
 
     func comment() {
@@ -116,8 +131,9 @@ final class EditorController: ObservableObject {
 
     func codeBlock() { textView?.insertSnippet("```\n\n```\n", caretOffset: 4) }
     func divider() { textView?.insertSnippet("\n---\n") }
+    static let tableSnippet = "|  |  |  |\n| --- | --- | --- |\n|  |  |  |"
     func table() {
-        textView?.insertSnippet("| Column | Column | Column |\n| ------ | ------ | ------ |\n|        |        |        |\n", caretOffset: 2)
+        textView?.insertSnippet(Self.tableSnippet + "\n", caretOffset: 2)
     }
     func insertDate() {
         let f = DateFormatter()
@@ -196,7 +212,7 @@ final class EditorController: ObservableObject {
         SlashCommand(id: "quote", title: "Quote", subtitle: "Call out a passage", symbol: "text.quote", keywords: ["blockquote", "cite"]) { c, r in c.applySlash(r, "> ") },
         SlashCommand(id: "code", title: "Code Block", subtitle: "Monospaced code", symbol: "chevron.left.forwardslash.chevron.right", keywords: ["code", "pre", "snippet"]) { c, r in c.applySlash(r, "```\n\n```", caret: 4) },
         SlashCommand(id: "table", title: "Table", subtitle: "3 × 3 grid", symbol: "tablecells", keywords: ["grid", "table"]) { c, r in
-            c.applySlash(r, "| Column | Column | Column |\n| ------ | ------ | ------ |\n|        |        |        |", caret: 2)
+            c.applySlash(r, EditorController.tableSnippet, caret: 2)
         },
         SlashCommand(id: "image", title: "Image…", subtitle: "Insert a picture", symbol: "photo", keywords: ["picture", "img", "photo"]) { c, r in c.applySlash(r, ""); c.insertImage() },
         SlashCommand(id: "hr", title: "Divider", subtitle: "Separate sections", symbol: "minus", keywords: ["rule", "hr", "line", "separator"]) { c, r in c.applySlash(r, "---\n") },

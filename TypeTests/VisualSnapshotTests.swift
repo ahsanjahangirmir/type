@@ -89,6 +89,13 @@ final class VisualSnapshotTests: XCTestCase {
 
     > Never trust an unsigned payload.
 
+    | Event | Retries | Owner |
+    | --- | --- | --- |
+    | invoice.paid | 5 | **Billing** |
+    | customer.deleted | 3 | Accounts |
+
+    Recurring I*ncome/Expe*nses and ***~~==stacked==~~*** formats.
+
     ```json
     { "event": "invoice.paid" }
     ```
@@ -119,5 +126,14 @@ final class VisualSnapshotTests: XCTestCase {
         try ImageStore.pngData(img)!.write(to: dir.appendingPathComponent(".assets/shot.png"))
         let md = "# Screenshot test\n\nA paragraph before the image.\n\n> A quote right above.\n![shot](.assets/shot.png \"width=420\")\nText right after the image.\n"
         try render(md, name: "image", baseURL: dir) { $0.hideSyntax = true }
+    }
+
+    func testExportDocuments() async throws {
+        guard let outDir else { throw XCTSkip("no snapshot dir") }
+        try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        let md = sample + "\n\n" + (1...12).map { "Paragraph \($0): " + String(repeating: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", count: 4) }.joined(separator: "\n\n")
+        for format in [ExportFormat.pdf, .word, .rtf, .html] {
+            try await Exporter.write(markdown: md, title: "Webhooks", baseURL: nil, format: format, fontChoice: .serif, customFamily: "", to: outDir.appendingPathComponent("export.\(format.fileExtension)"))
+        }
     }
 }

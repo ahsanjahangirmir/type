@@ -1,0 +1,52 @@
+---
+import Base from '../layouts/Base.astro';
+import { site } from '../data/site';
+---
+<Base>
+  <header class="nav" id="top">
+    <a class="wordmark" href="#top" aria-label="Type, back to top">Type<span class="wordmark-dot">.</span></a>
+    <span class="nav-note">A little less interface.<br />A lot more room to write.</span>
+    <nav aria-label="Main navigation">
+      <a class="nav-link" href="#the-app">The app</a>
+      <a class="nav-link" href="#details">The details</a>
+      <a class="button button-small" href={site.github}><span>Open GitHub</span><span class="arrow" aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+  <main id="main" tabindex="-1">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-topline"><span><i class="status-dot" aria-hidden="true"></i> Free, open source writing for Mac</span><span class="hero-top-right">An open page. An open possibility.</span></div>
+      <h1 id="hero-title"><span class="hero-line">Room to</span><span class="hero-line second">write<span class="caret" aria-hidden="true"></span><span class="period">.</span></span></h1>
+      <div class="hero-bottom"><p>For the notes, the novels,<br />and the things you write for yourself.<br /><strong>No subscription required.</strong></p><a class="explore" href="#the-app"><span>Find your focus</span><span aria-hidden="true">↓</span></a><span class="hero-system">Native to your Mac.<br />{site.compatibility}</span></div>
+      <div class="spatial-scene" aria-hidden="true">
+        <div class="scene-plane">
+          <img class="hero-window" src="/media/paper.webp" alt="" width="1984" height="1056" fetchpriority="high" />
+          <img class="fragment fragment-toolbar" src="/media/toolbar.webp" alt="" width="960" height="90" />
+          <img class="fragment fragment-sidebar" src="/media/sidebar.webp" alt="" width="430" height="590" />
+          <div class="free-stamp"><span>Free to use</span><span class="stamp-star">✳</span><span>Open by nature</span></div>
+        </div>
+      </div>
+    </section>
+    <section class="app-intro section-pad" id="the-app" aria-labelledby="intro-title">
+      <div class="section-meta"><span>Less between you and your next thought.</span><span>Meet Type</span></div>
+      <div class="intro-grid"><h2 id="intro-title">The app steps back.<br /><span>Your words step forward.</span></h2><p>A native Mac writing app that gives every thought a place. Gather your pages into notebooks. Then let everything else fall away.</p></div>
+      <figure class="product-figure"><div class="product-surface"><img src="/media/paper.webp" alt="Type’s native Mac window with notebooks on the left and a sample page called A little room to think in the editor." width="1984" height="1056" loading="lazy" /></div><figcaption><span>Actual Type app. Original sample writing.</span><span>Notebooks. Pages. A clear head.</span></figcaption></figure>
+    </section>
+    <section class="focus-section section-pad" aria-labelledby="focus-title">
+      <div class="focus-copy"><span class="small-label">One paragraph at a time</span><h2 id="focus-title">Everything else<br />can wait.</h2><p>Focus mode softens the rest of the page, so you can stay with the thought in front of you. A toolbar that steps aside while you type keeps it that way.</p><button class="focus-switch" aria-pressed="false" aria-controls="focus-image"><span class="switch-track" aria-hidden="true"><i></i></span><span data-focus-label>Try focus mode</span></button><span class="keyboard-note">In Type: <kbd>⇧</kbd><kbd>⌘</kbd><kbd>F</kbd></span></div>
+      <figure class="focus-figure"><div class="focus-image-wrap" id="focus-image"><img src="/media/paper-editor.webp" alt="Type editor showing the original sample manuscript with all paragraphs visible." width="1500" height="1009" loading="lazy" /><img class="focus-overlay" src="/media/focus-editor.webp" alt="" aria-hidden="true" width="1500" height="1009" loading="lazy" /></div><figcaption>Same page. A little more presence.</figcaption></figure>
+    </section>
+    <section class="themes-section section-pad" aria-labelledby="themes-title">
+      <div class="themes-heading"><h2 id="themes-title">Your words.<br />Your atmosphere.</h2><div><p>Morning light. A warmer page. The quiet of late night. Settle into a space that feels like yours.</p><div class="theme-controls" role="group" aria-label="App theme preview">{site.themes.map((theme,i) => <button class="theme-button" aria-pressed={i===0 ? 'true':'false'} data-theme-choice={theme.id}><i style={`--swatch:${theme.color}`} aria-hidden="true"></i><span>{theme.label}</span></button>)}</div></div></div>
+      <figure class="theme-gallery" data-active-theme="paper"><div class="theme-media">{site.themes.map((theme,i) => <img data-theme-image={theme.id} class:list={['theme-image',{'is-active':i===0}]} src={`/media/${theme.id}.webp`} alt={theme.alt} width="1984" height="1056" loading="lazy" aria-hidden={i!==0?'true':undefined} />)}</div><figcaption aria-live="polite"><span data-theme-note>{site.themes[0].note}</span><span>Paper / Sepia / Slate</span></figcaption></figure>
+    </section>
+    <section class="organization section-pad" aria-labelledby="organization-title"><div class="notebook-study"><img src="/media/notebooks.webp" alt="Type sidebar showing the sample notebooks Everyday, Journal, Long stories, and Work in progress, with individual Markdown pages beneath Everyday." width="680" height="950" loading="lazy" /></div><div class="organization-copy"><h2 id="organization-title">A home for<br />every thought.</h2><p>The first draft. The day’s loose ends. That idea you keep coming back to. Give each one a page, and keep the pages together in notebooks.</p><div class="ownership-note"><span class="file-icon" aria-hidden="true">.md</span><p><strong>Your files stay yours.</strong><br />A notebook is a folder. A page is a Markdown file. Saved automatically, in a library on your Mac.</p></div></div></section>
+    <section class="details section-pad" id="details" aria-labelledby="details-title"><div class="details-title"><h2 id="details-title">Small things.<br />Thought through.</h2><p>Enough to make writing feel right.<br />Nothing asking to be the main event.</p></div><div class="feature-list">{site.features.map(feature => <details><summary><span>{feature.title}</span><span class="detail-plus" aria-hidden="true">+</span></summary><div class="feature-body"><p>{feature.text}</p><span>{feature.detail}</span></div></details>)}</div></section>
+    <section class="manifesto section-pad" aria-labelledby="manifesto-title"><span class="manifesto-top">A blank page should be an open invitation.</span><h2 id="manifesto-title">Writing is<br />for <span>everyone.</span></h2><div class="manifesto-bottom"><p>Writing freely should not be a paid luxury.<br />Type is free to use and open source.<br />Read the code. Make it yours. Start a page.</p><a class="button button-large" href={site.github}><span>Open Type on GitHub</span><span class="arrow" aria-hidden="true">↗</span></a></div></section>
+  </main>
+  <footer class="footer section-pad"><div class="footer-top"><span>{site.promise}</span><a class="back-top nav-link" href="#top">Back to top <span aria-hidden="true">↑</span></a></div><div class="footer-brand" aria-hidden="true">Type<span>.</span></div><div class="footer-bottom"><span>A place for your next thought.</span><span>{site.compatibility}</span><a href={site.github}>Source code ↗</a></div></footer>
+  <script>
+    import { start } from '../engine';
+    import { setupPage } from '../motion/type';
+    start(setupPage);
+  </script>
+</Base>
