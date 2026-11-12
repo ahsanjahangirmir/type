@@ -39,3 +39,7 @@ Never use `--prod` for this work. Git deployments are disabled in `vercel.json`,
 The brief, concept scoring, art direction, motion rules, and capture safeguards are recorded in `../DESIGN.md`. Structured theme and feature content lives in `src/data/site.ts`; page-specific copy lives in `src/pages/index.astro`. Styles are in `src/styles/site.css`; the hero focus driver is in `src/motion/type.ts`.
 
 Actual sample-only app media is in `public/media/`, with capture provenance in `PROVENANCE.md`. Fonts are self-hosted, with their source and license references in `public/fonts/README.md`. No user writing, invented testimonials, fake usage metrics, or paid plans are included. This page does not add a license to the app repository.
+
+### Initial-project limitation
+
+Vercel CLI 65.14.0 refuses Preview as the first deployment in a new project (`first_deployment_production`). This project's initial deployment is pending approval because delivery was planned as Preview-only. Do not retry with `--prod` without authorization. The website and its GitHub destination are ready; no deployment has been created yet.

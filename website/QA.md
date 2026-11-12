@@ -58,3 +58,7 @@ node /Users/ajm/.codex/skills/awwwards/scripts/audit.mjs http://127.0.0.1:4400/
 All 53 preexisting repository files were hashed before website work and remained byte-identical after implementation. The user's uncommitted native app improvements were preserved and excluded from the website commit. Actual product media contains only original sample writing. See `public/media/PROVENANCE.md` for capture isolation and the corrected initial app-resolution issue.
 
 Vercel dry run: only website sources/assets/configuration. Native app source, all `.env*`, `.vercel`, node_modules, build output, scripts, and all `.shots*` directories are excluded. Dedicated project `type-product-page`; Git deployments disabled. CLI deployment explicitly targets Preview; no production deployment, GitHub push, merge, or domain promotion.
+
+## Deployment status
+
+Vercel CLI 65.14.0 refused the explicit Preview deployment with `first_deployment_production`: a new project's first deployment is assigned to Production, and the CLI requires user approval before retrying with `--prod`. No deployment was created. The project is linked and ready, but changing the agreed Preview-only delivery to an initial Production deployment is pending approval. No unrelated existing Vercel project was repurposed.
